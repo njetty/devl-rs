@@ -9,8 +9,8 @@
 //! windows and prefix KV, then a commit) and checks that the committed tokens equal the backend's
 //! own offline greedy decode of the whole clip, with and without checkpoint promotion. It also
 //! checks that cached windows are reused for a clip longer than one window. It does not compare
-//! against upstream token ids: full real-checkpoint parity is the scope of the parity issue
-//! (#26). The audio attention mode is block-windowed (`docs/ARCHITECTURE.md` Section 6.13).
+//! against upstream token ids: upstream parity is tested by
+//! `qwen3_asr_parity_reference.rs`. The audio attention mode is block-windowed (`docs/ARCHITECTURE.md` Section 6.13).
 //!
 //! Run with `cargo test -p devl-candle --release --test qwen3_asr_backend_reference -- --nocapture`.
 //! Weights and clips are never committed.

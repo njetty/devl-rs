@@ -6,11 +6,14 @@
 //! checkpoint, only with a shorter window. The opt-in real-checkpoint smoke test lives in
 //! `qwen3_asr_backend_reference.rs`.
 
+mod common;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
+use common::Probe;
 use devl_candle::qwen3_asr::{
     Qwen3AsrAudioConfig, Qwen3AsrAudioEncoder, Qwen3AsrAudioEncoding, Qwen3AsrBackend,
     Qwen3AsrBackendConfig, Qwen3AsrDecodeState, Qwen3AsrDecoder, Qwen3AsrError, Qwen3AsrTextConfig,
@@ -863,5 +866,121 @@ fn session_with_growing_audio_matches_offline_greedy() {
         let mut s = DevlSession::new(&b, config).unwrap();
         s.push_audio(pcm).unwrap();
         assert_eq!(s.commit().unwrap().tokens, offline(&b, pcm, 12), "case {n}");
+    }
+}
+
+fn session_config(promotion: bool) -> SessionConfig {
+    SessionConfig {
+        max_tokens: 12,
+        enable_checkpoint_promotion: promotion,
+    }
+}
+
+/// Runs a chunked session through a probe and returns the committed tokens and the call log.
+fn probed_session(
+    b: &Qwen3AsrBackend,
+    pcm: &[f32],
+    chunk: usize,
+    promotion: bool,
+) -> (Vec<TokenId>, common::Log) {
+    let probe = Probe::new(b);
+    let mut s = DevlSession::new(&probe, session_config(promotion)).unwrap();
+    for part in pcm.chunks(chunk) {
+        s.push_audio(part).unwrap();
+        s.run_draft().unwrap();
+    }
+    let tokens = s.commit().unwrap().tokens.clone();
+    drop(s);
+    (tokens, probe.log())
+}
+
+#[test]
+fn session_reuses_final_windows_and_leaves_partial_windows_uncached() {
+    let b = backend();
+    // 30000 samples: four final windows and a partial fifth, reached in 8000-sample steps.
+    // The first step is not padded, so no earlier window depends on padding.
+    // The loudest audio comes first, so the global maximum and the floor never move.
+    let pcm = cat(&[&noise(7_000, 0.9, 31), &noise(23_000, 0.3, 32)]);
+    let expected = offline(&b, &pcm, 12);
+    for promotion in [false, true] {
+        let (tokens, log) = probed_session(&b, &pcm, 8_000, promotion);
+        assert_eq!(tokens, expected, "promotion {promotion}");
+        assert!(log.reused_windows() > 0, "later drafts must reuse windows");
+        assert_eq!(log.floor_changes(), 0);
+        assert_eq!(log.invalidated_windows(), 0, "no window may be rebuilt");
+        assert!(log.tail_encodes() > 0, "a partial window must be encoded");
+        let last = log.encodes.last().unwrap();
+        assert_eq!(last.samples, pcm.len());
+        assert_eq!(last.final_windows, 4);
+        assert!(last.stats.tail_windows > 0);
+        // Every draft after the first starts from the cached prompt prefix.
+        for e in log
+            .encodes
+            .iter()
+            .skip(1)
+            .filter(|e| e.prior_final_windows > Some(0))
+        {
+            assert_eq!(e.stats.prefilled_prefix_tokens, 0);
+        }
+    }
+}
+
+#[test]
+fn session_rebuilds_windows_when_later_audio_moves_the_normalization_floor() {
+    let b = backend();
+    // A quiet tone clamps at the floor once a loud tone raises the global maximum. The first step
+    // is not padded, so a rebuild can only come from the moved floor.
+    let pcm = cat(&[&tone(0..20_000, 0.01), &tone(20_000..33_000, 0.9)]);
+    let expected = offline(&b, &pcm, 12);
+    for promotion in [false, true] {
+        let (tokens, log) = probed_session(&b, &pcm, 8_000, promotion);
+        assert_eq!(tokens, expected, "promotion {promotion}");
+        assert!(log.floor_changes() > 0, "the floor must move");
+        assert!(
+            log.invalidated_windows() > 0,
+            "stale windows must be rebuilt"
+        );
+        // Windows before the loud audio arrives are still reused.
+        assert!(log.reused_windows() > 0);
+        let last = log.encodes.last().unwrap();
+        let fresh = b.encode_audio(&pcm, None).unwrap();
+        assert_eq!(last.floor, fresh.floor());
+        assert_eq!(last.final_windows, fresh.final_windows());
+    }
+}
+
+#[test]
+fn rejected_draft_rolls_back_and_resumes_to_offline_greedy_on_reused_windows() {
+    let b = backend();
+    let pcm = noise(30_000, 0.4, 31);
+    let expected = offline(&b, &pcm, 12);
+    assert!(expected.len() > 5, "scenario needs a few generated tokens");
+    let split = 19_000;
+    for bad_at in [0, 1, 3, expected.len() - 1] {
+        let mut draft = expected.clone();
+        draft[bad_at] = (draft[bad_at] + 1) % 62;
+        assert_ne!(draft[bad_at], expected[bad_at]);
+        let probe = Probe::new(&b);
+        let mut s = DevlSession::new(&probe, session_config(false)).unwrap();
+        // The commit encodes the full buffer on top of this earlier encoding.
+        s.push_audio(&pcm[..split]).unwrap();
+        s.run_draft().unwrap();
+        s.push_audio(&pcm[split..]).unwrap();
+        s.seed_draft_for_test(draft.clone(), 0);
+        let result = s.commit().unwrap().clone();
+        drop(s);
+        let log = probe.log();
+        assert_eq!(result.tokens, expected, "bad_at {bad_at}");
+        assert_eq!(result.accepted_prefix_len, bad_at);
+        assert!(!result.was_promoted);
+        let commit_encode = log.encodes.last().unwrap();
+        assert!(commit_encode.stats.reused_windows > 0, "bad_at {bad_at}");
+        let verify = log.verifies.last().unwrap();
+        assert_eq!(verify.draft, draft);
+        assert!(verify.mismatched());
+        assert_eq!(verify.accepted(), bad_at);
+        // The cache keeps the verified prefix plus the corrected token's predecessors only.
+        assert_eq!(*log.rollbacks.last().unwrap(), bad_at);
+        assert_eq!(result.decode_steps, expected.len() - (bad_at + 1));
     }
 }
