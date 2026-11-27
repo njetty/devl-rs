@@ -3,7 +3,8 @@
 //! Provides deterministic Whisper log-mel feature extraction ([`mel`]),
 //! stateless Whisper encoder/decoder layers with external KV-cache rollback
 //! ([`whisper`]), and the [`CandleWhisperBackend`] implementation of
-//! [`DevlBackend`].
+//! [`DevlBackend`]. The [`qwen3_asr`] module holds the Qwen3-ASR audio
+//! frontend and windowed encoder (decoder and backend are not yet implemented).
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/njetty/devl-rs/main/assets/icon-ink.svg",
@@ -11,6 +12,7 @@
 )]
 
 pub mod mel;
+pub mod qwen3_asr;
 pub mod whisper;
 
 use candle_core::{DType, Device, Tensor};
