@@ -26,3 +26,23 @@ workspace = true
 [package.metadata.docs.rs]
 features = ["candle", "test-utils"]
 rustdoc-args = ["--cfg", "docsrs"]
+
+[dev-dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+candle-transformers.workspace = true
+hound = "3.5"
+serde_json = "1"
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+
+[[example]]
+name = "file_stream"
+required-features = ["candle"]
+
+[[example]]
+name = "multi_stream"
+required-features = ["candle"]
+
+[[example]]
+name = "bench_ttfs"
+required-features = ["candle"]

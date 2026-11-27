@@ -44,6 +44,57 @@ devl = "0.1.0-alpha.1"
 # devl-core = "0.1.0-alpha.1"
 ```
 
+## Local Whisper examples
+
+Use a local Hugging Face Whisper checkpoint directory with `config.json` and
+a single `model.safetensors` file. For example, use `openai/whisper-tiny.en` for
+English audio. The examples use F32 inference, a built-in Slaney mel filter
+bank, and an English transcription prompt. Each input must be a nonempty
+16 kHz mono PCM16 or IEEE Float32 WAV, at most 30 seconds long.
+
+Run from the repository root with paths to your local files:
+
+```bash
+model=/path/to/whisper-tiny.en
+wav=/path/to/sample_16k_mono.wav
+other_wav=/path/to/another_16k_mono.wav
+
+cargo run --release -p devl --features candle --example file_stream -- cpu "$model" "$wav"
+cargo run --release -p devl --features candle --example multi_stream -- cpu "$model" "$wav" "$other_wav"
+cargo run --release -p devl --features candle --example bench_ttfs -- cpu "$model" "$wav" "$other_wav" > ../ttfs.json
+```
+
+On Apple Silicon, use `--features metal` and pass `metal` in place of `cpu`
+to run on the first Metal device.
+
+- `file_stream` replays 100 ms chunks as fast as the session can process them.
+  It drafts every two seconds of audio before the final chunk, with an earlier
+  checkpoint for shorter inputs spanning multiple chunks. It emits JSON lines
+  containing draft tokens and final tokens with verified prefix statistics.
+- `multi_stream` shares the model across two or more sessions and uses one
+  inference worker. The replay producer submits commits while the first draft
+  is at a decode-step boundary, allowing the running draft to yield and pending
+  drafts for ending streams to be evicted. A draft that reaches EOS in prefill
+  can complete before the producer submits the commits. Each stream's TTFS
+  includes its queue wait and delivery of its remaining audio to its session.
+- `bench_ttfs` measures one trial per WAV argument in order. Repeat paths to
+  collect repeated trials. It runs the uncached offline greedy reference first
+  on each fixture, then replays the same PCM through DEVL with checkpoint
+  promotion disabled. Offline timing starts with full PCM available. DEVL
+  timing starts after the final chunk has been pushed. Both stop when the final
+  tokens are available and the device has synchronized. Model and WAV loading
+  are outside the measurements. The harness reports draft work separately.
+
+The benchmark emits one JSON object with the executable argument vector,
+working directory, selected environment settings, checkout SHA and status,
+hardware, model, device, dtype, content identifiers (Git blob hashes) for
+model files and fixtures, and per-trial results. Run the Cargo command
+above from a clean checkout to tie the binary to the recorded SHA. The summary
+reports the median (averaging the two middle observations for an even sample
+count), nearest-rank p99, accepted tokens divided by total verified draft
+tokens (`null` when no draft tokens were verified), and exact token-match
+rate. A parity mismatch produces the JSON report and a nonzero exit status.
+
 ## Build and Test
 
 ```bash
@@ -72,7 +123,8 @@ cargo package --list -p devl-core
 Status: `v0.1-alpha` in active development.
 
 - **Implemented:** `devl-core` (`DevlBackend` trait, `DevlSession` state machine, single-pass verify/rollback/resume loop, `PriorityScheduler` with step-level cooperative preemption, and deterministic `MockBackend` test suite) and the `devl` facade crate.
-- **In progress (Phase 2):** `devl-candle` Whisper and Qwen3-ASR inference implementations, deterministic mel extraction, and per-layer KV-cache truncation (currently compiling trait stubs).
+- **Implemented:** Local Whisper inference over Candle, deterministic mel extraction, per-layer KV-cache truncation, and local streaming examples.
+- **Planned (`v0.2`):** Qwen3-ASR inference over Candle.
 - **Planned (`v0.2`):** `devl-server` transport layer (WebSocket/HTTP, stream multiplexing, and VAD/endpointing hooks).
 
 ## Contributing
