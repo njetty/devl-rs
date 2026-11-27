@@ -1,26 +1,34 @@
-//! Qwen3-ASR audio frontend and windowed encoder.
+//! Qwen3-ASR audio frontend, windowed encoder, and causal text decoder.
 //!
-//! Converts 16 kHz mono PCM into 2048-wide audio embeddings for the pinned
-//! `Qwen/Qwen3-ASR-1.7B` checkpoint (see `docs/ARCHITECTURE.md` Section 6).
-//! The decoder, prefix KV reuse, and the [`devl_core::DevlBackend`]
-//! implementation are not part of this module.
+//! Converts 16 kHz mono PCM into 2048-wide audio embeddings and decodes them with a
+//! position-aware KV cache for the pinned `Qwen/Qwen3-ASR-1.7B` checkpoint (see
+//! `docs/ARCHITECTURE.md` Section 6). Prefix KV reuse across audio growth and the
+//! [`devl_core::DevlBackend`] implementation are not part of this module.
 //!
 //! - [`frontend`]: variable-length log-mel features with the global clamp floor.
 //! - [`config`]: audio tower hyperparameters and token-count arithmetic.
 //! - [`encoder`]: the chunked convolution stack and the block-attention transformer.
-//! - [`weights`]: selective, memory-safe loading of `thinker.audio_tower.*` tensors.
+//! - [`decoder`]: causal prefill and incremental greedy step over absolute RoPE positions.
+//! - [`kv_cache`]: forkable and truncatable decoder KV cache.
+//! - [`weights`]: selective, memory-safe loading of `thinker.*` tensors.
 
 pub mod config;
+pub mod decoder;
 pub mod encoder;
 pub mod frontend;
+pub mod kv_cache;
 pub mod weights;
 
-pub use config::{Qwen3AsrAudioConfig, conv_output_len};
+pub use config::{
+    Qwen3AsrAudioConfig, Qwen3AsrTextConfig, STOP_TOKEN_IDS, conv_output_len, is_stop_token,
+};
+pub use decoder::{Qwen3AsrDecoder, argmax_rows};
 pub use encoder::Qwen3AsrAudioEncoder;
 pub use frontend::{
     HOP_LENGTH, MAX_SAMPLES, MIN_SAMPLES, N_FFT, QWEN3_ASR_SAMPLE_RATE_HZ, Qwen3AsrMel,
     Qwen3AsrMelFrontend, frame_count, prepare_pcm, samples_to_finalize_frame,
 };
+pub use kv_cache::Qwen3AsrKvCache;
 
 use thiserror::Error;
 
@@ -74,6 +82,28 @@ pub enum Qwen3AsrError {
         /// Number of windows in the clip.
         windows: usize,
     },
+
+    /// KV cache truncation target is longer than the cached sequence.
+    #[error("cannot truncate KV cache of length {len} to {requested}")]
+    InvalidCacheLength {
+        /// Requested length.
+        requested: usize,
+        /// Current cached length.
+        len: usize,
+    },
+
+    /// The sequence would exceed the model's position limit.
+    #[error("sequence length {requested} exceeds the maximum of {max} positions")]
+    ContextTooLong {
+        /// Length the sequence would reach.
+        requested: usize,
+        /// Maximum supported length.
+        max: usize,
+    },
+
+    /// Decoder input does not match the model or the prompt layout.
+    #[error("invalid decoder input: {0}")]
+    InvalidInput(String),
 
     /// Invalid or unsupported model configuration.
     #[error("invalid Qwen3-ASR configuration: {0}")]
