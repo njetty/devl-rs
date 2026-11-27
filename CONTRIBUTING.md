@@ -206,12 +206,6 @@ Maintainers cut a release in two steps:
 
 Pushing a `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which verifies the tag matches `Cargo.toml`, runs `fmt`/`clippy`/`test`, authenticates with crates.io via OIDC Trusted Publishing (`rust-lang/crates-io-auth-action@v1`), and runs `cargo publish --workspace` in topological dependency order (`devl-core` → `devl-candle` → `devl`).
 
-For v0.1.0, verify that the packaged README shows the DEVL mark on crates.io
-and that docs.rs displays the logo and favicon for all three crates. The shared
-artwork lives in [`assets/icon-ink.svg`](assets/icon-ink.svg) and
-[`assets/icon-paper.svg`](assets/icon-paper.svg). Reuse it for future CLI
-installers and launchers that support an icon.
-
 ## License
 
 `devl-rs` is licensed under the [Apache License, Version 2.0](LICENSE). Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this repository is licensed under the same terms, as described in Section 5 of the license.
