@@ -1,0 +1,69 @@
+name: Feature / Task
+description: Propose or track an atomic, implementable feature or engineering task.
+labels:
+  - "type: feature"
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: Concise statement of the capability or engineering outcome this issue delivers.
+      placeholder: Implement deterministic Whisper log-mel spectrogram extraction for 80-bin and 128-bin configs.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: crate_ownership
+    attributes:
+      label: Crate Ownership
+      description: Primary crate or workspace area owning this change.
+      options:
+        - devl-core
+        - devl-candle
+        - devl
+        - workspace / CI
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope_files
+    attributes:
+      label: Scope / Files
+      description: Concrete modules, files, traits, or tests expected to be added or modified.
+      placeholder: |
+        - crates/devl-candle/src/whisper/mel.rs
+        - crates/devl-candle/src/whisper/mod.rs
+    validations:
+      required: true
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-Goals / Out of Scope
+      description: Explicitly list adjacent work that must not be folded into this issue.
+      placeholder: |
+        - Do not implement decoder KV-cache truncation in this issue.
+        - Do not add network model downloads to unit tests.
+    validations:
+      required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: Blocking issues, prerequisites, or architectural constraints (or write "None").
+      placeholder: None
+    validations:
+      required: false
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Verifiable conditions and commands required before closing this issue.
+      placeholder: |
+        - Produces deterministic output matching reference offline preprocessing.
+        - Unit tests cover 80-bin and 128-bin configurations without network access.
+        - `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features devl/candle` pass.
+    validations:
+      required: true

@@ -1,0 +1,59 @@
+name: Milestone / Release Tracking
+description: Track milestone exit criteria and pre-release verification for a target version.
+labels:
+  - "type: release"
+body:
+  - type: input
+    id: target_version
+    attributes:
+      label: Target Version
+      description: Semantic version targeted by this milestone or release.
+      placeholder: v0.1.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: milestone_goal
+    attributes:
+      label: Milestone Goal
+      description: Concise summary of the release objective aligned with docs/ROADMAP.md.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope_phases
+    attributes:
+      label: Scope / Included Phases
+      description: List the roadmap phases and linked tracking issues included in this release.
+    validations:
+      required: true
+
+  - type: textarea
+    id: exit_criteria
+    attributes:
+      label: Exit Criteria
+      description: Concrete technical and quality requirements that must hold before tagging the release.
+      placeholder: |
+        - All issues assigned to the milestone are closed with acceptance criteria satisfied.
+        - Public API and rustdoc audit completed across devl-core, devl-candle, and devl.
+        - docs/ROADMAP.md and CHANGELOG.md updated for the shipped version.
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification_checklist
+    attributes:
+      label: Pre-Release Verification Checklist
+      description: Exact verification commands and release steps required prior to publishing.
+      value: |
+        - [ ] `cargo fmt --check`
+        - [ ] `cargo clippy --workspace --all-targets -- -D warnings`
+        - [ ] `cargo clippy -p devl --all-targets --features candle,test-utils -- -D warnings`
+        - [ ] `cargo test --workspace`
+        - [ ] `cargo test -p devl --features test-utils`
+        - [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features devl/candle`
+        - [ ] `cargo package --list -p devl-core && cargo package --list -p devl-candle && cargo package --list -p devl`
+        - [ ] All six required CI checks pass on the release commit on `main`
+        - [ ] Signed version tag `v<version>` pushed to trigger crates.io Trusted Publishing
+    validations:
+      required: true

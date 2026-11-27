@@ -26,7 +26,7 @@ Offline speech recognition models typically achieve lower error rates than strea
 | `devl-core` | Runtime- and transport-agnostic core crate (zero ML or networking dependencies). Owns `DevlBackend`, `DevlSession`, single-pass verification and KV rollback, `PriorityScheduler`, and `MockBackend`. | `test-utils` |
 | `devl-candle` | Local inference backend over `candle-core`, `candle-nn`, and `candle-transformers` for Whisper and Qwen3-ASR. | `metal`, `cuda` |
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for trait signatures, exactness invariants, session states, and scheduler preemption rules.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for trait signatures, exactness invariants, session states, and scheduler preemption rules, and [docs/ROADMAP.md](docs/ROADMAP.md) for the multi-release plan.
 
 ## Usage
 
@@ -74,6 +74,10 @@ Status: `v0.1-alpha` in active development.
 - **Implemented:** `devl-core` (`DevlBackend` trait, `DevlSession` state machine, single-pass verify/rollback/resume loop, `PriorityScheduler` with step-level cooperative preemption, and deterministic `MockBackend` test suite) and the `devl` facade crate.
 - **In progress (Phase 2):** `devl-candle` Whisper and Qwen3-ASR inference implementations, deterministic mel extraction, and per-layer KV-cache truncation (currently compiling trait stubs).
 - **Planned (`v0.2`):** `devl-server` transport layer (WebSocket/HTTP, stream multiplexing, and VAD/endpointing hooks).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, local verification, pull request rules, and signed-commit requirements. Contributors and coding agents must also follow [AGENTS.md](AGENTS.md) for workspace boundaries, issue execution workflow, and clean-room documentation rules.
 
 ## License
 

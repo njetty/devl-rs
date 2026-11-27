@@ -2,11 +2,17 @@
 
 `devl-rs` is an independent, unofficial open-source Rust implementation of **DEVL: Decode Early, Verify Late** ([arXiv:2611.20064](https://arxiv.org/abs/2611.20064)), developed in public at [njetty/devl-rs](https://github.com/njetty/devl-rs). Pull requests from outside contributors are welcome and go through the same CI checks as maintainer changes. Only maintainers can push branches directly to the repository, manage labels, or trigger manual workflows. Outside contributors work from a fork and open pull requests against `main`.
 
-Architectural boundaries, trait contracts, exactness invariants, and scheduler preemption rules live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Read it before changing code, whether you write the change yourself or with a coding agent.
+Architectural boundaries, trait contracts, exactness invariants, and scheduler preemption rules live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The high-level multi-release plan lives in [docs/ROADMAP.md](docs/ROADMAP.md), and the contributor/agent execution contract lives in [AGENTS.md](AGENTS.md). Read those documents before changing code, whether you write the change yourself or with a coding agent.
 
 ## Report a problem
 
-[Open an issue](https://github.com/njetty/devl-rs/issues/new) describing what you ran, what you expected, and what happened instead. Include:
+[Choose an issue template](https://github.com/njetty/devl-rs/issues/new/choose) (defined in [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/)):
+
+- **Feature / Task** (`feature.yml`) for atomic implementation work with explicit goal, scope, non-goals, dependencies, and acceptance criteria.
+- **Bug Report** (`bug.yml`) for incorrect behavior, exactness regressions, or build failures.
+- **Milestone / Release Tracking** (`milestone_release.yml`) for release exit criteria and pre-release checklists.
+
+When filing a bug report, describe what you ran, what you expected, and what happened instead, including:
 
 - Output of `rustc --version` and `cargo --version`.
 - Target platform and feature flags (for example, `linux-x86_64`, `linux-arm64`, `macos-arm64 --features metal`, or `windows-x86_64`).
@@ -60,7 +66,7 @@ These rules apply to every change:
 - **No untracked artifacts:** Do not commit `Cargo.lock`, `/target`, downloaded model weights, or machine-specific home-directory paths.
 - **No speculative docs:** Do not document behavior that has not been implemented yet unless clearly marked as planned status.
 
-If a coding agent assists with your change, point it at [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and this file. Keep all prose (commit messages, pull request titles and descriptions, rustdoc, and markdown docs) dry, technical, and concise.
+If a coding agent assists with your change, point it at [AGENTS.md](AGENTS.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/ROADMAP.md](docs/ROADMAP.md), and this file. Keep all prose (commit messages, pull request titles and descriptions, rustdoc, and markdown docs) dry, technical, and concise.
 
 ## Test your change
 
@@ -121,9 +127,9 @@ cargo check -p devl --all-targets --features metal
 
 ### Choose a label
 
-Every pull request needs exactly one `type:` label before merge:
+Every pull request and issue needs exactly one `type:` label before merge:
 
-| Label | Use when the pull request |
+| Label | Use when the pull request or issue |
 | :--- | :--- |
 | `type: bug` | Fixes incorrect behavior |
 | `type: feature` | Adds a new user-facing capability |
@@ -133,7 +139,15 @@ Every pull request needs exactly one `type:` label before merge:
 | `type: release` | Prepares or repairs a crates.io release |
 | `type: security` | Fixes or hardens a security boundary |
 
-Maintainers assign the label when opening a pull request and update it if the scope changes. Outside contributors leave the label unset; a maintainer adds it during review.
+Apply `crate:` scope labels alongside the `type:` label whenever an issue or pull request targets specific workspace crates:
+
+| Label | Use when changes affect |
+| :--- | :--- |
+| `crate: devl-core` | `crates/devl-core` |
+| `crate: devl-candle` | `crates/devl-candle` |
+| `crate: devl` | `crates/devl` facade |
+
+Maintainers assign labels when opening a pull request or triaging an issue and update them if the scope changes. Outside contributors leave labels unset on pull requests; a maintainer adds them during review.
 
 ## CI checks
 
@@ -168,8 +182,9 @@ Pull requests are squash-merged into `main` to preserve linear history, and merg
 Update documentation in the same pull request as the behavior it changes:
 
 - Update [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) whenever trait signatures, session states, scheduler rules, or backend designs change.
+- Update [docs/ROADMAP.md](docs/ROADMAP.md) only when a release ships or phase scope intentionally changes (never add per-issue checklists to it).
+- Update [AGENTS.md](AGENTS.md) and `CONTRIBUTING.md` when workflow contracts, local setup steps, CI checks, or PR rules change.
 - Update rustdoc comments alongside any public API addition or change (`missing_docs` and `RUSTDOCFLAGS="-D warnings"` enforce this in CI).
-- Update `CONTRIBUTING.md` when local setup steps, CI checks, or PR rules change.
 - Update `README.md` only when one of its statements becomes outdated or a major capability changes (for example, completing Phase 2 Whisper support or adding `devl-server`).
 - Do not edit `CHANGELOG.md` or bump workspace crate versions in feature pull requests; maintainers handle version bumps and changelog entries in dedicated `type: release` pull requests.
 

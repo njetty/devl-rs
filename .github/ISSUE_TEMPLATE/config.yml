@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Architecture Specification
+    url: https://github.com/njetty/devl-rs/blob/main/docs/ARCHITECTURE.md
+    about: Read trait contracts, exactness invariants, session states, and scheduler rules before proposing changes.
+  - name: Release Roadmap
+    url: https://github.com/njetty/devl-rs/blob/main/docs/ROADMAP.md
+    about: Review high-level release phases (v0.1.0 through v0.3.0) before filing new work.
+  - name: Report a Security Vulnerability
+    url: https://github.com/njetty/devl-rs/security/advisories/new
+    about: Report security issues privately via GitHub Security Advisories instead of opening a public issue.

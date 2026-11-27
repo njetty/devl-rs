@@ -1,0 +1,59 @@
+name: Bug Report
+description: Report incorrect behavior, exactness regressions, or build failures.
+labels:
+  - "type: bug"
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Clear, concise description of the defect.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: crate_affected
+    attributes:
+      label: Crate Affected
+      description: Select the primary crate or workspace area exhibiting the bug.
+      options:
+        - devl-core
+        - devl-candle
+        - devl
+        - workspace / CI
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_vs_actual
+    attributes:
+      label: Expected vs. Actual Behavior
+      description: State what should happen (referencing docs/ARCHITECTURE.md invariants if relevant) and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal Reproduction
+      description: Minimal code, test case, or command to reproduce. Prefer a deterministic MockBackend test for devl-core protocol or scheduler bugs.
+      placeholder: |
+        ```rust
+        // Minimal MockBackend or backend test demonstrating the failure
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Provide `rustc --version`, `cargo --version`, OS/architecture, enabled Cargo features, and commit SHA.
+      placeholder: |
+        - rustc:
+        - cargo:
+        - OS / arch:
+        - Features:
+        - Commit SHA:
+    validations:
+      required: true
