@@ -1,8 +1,8 @@
 # `devl-server` Streaming Contract
 
-Status: contract version `1.0`, implemented in `crates/devl-server` as types, binary audio framing, limits, and a validating per-stream state machine. The session coordinator (`Coordinator`, `StreamSession`) drives per-stream sessions through `PriorityScheduler`. Endpoint adapters, backend selection, endpointing, authentication, and deployment are not implemented; see [Boundaries](#boundaries).
+Status: contract version `1.0`, implemented in `crates/devl-server` as types, binary audio framing, limits, and a validating per-stream state machine. The session coordinator (`Coordinator`, `StreamSession`) drives per-stream sessions through `PriorityScheduler`. A synchronous WebSocket adapter (`WsServer`) maps the contract onto connections. HTTP endpoints, backend selection, endpointing, authentication, and deployment are not implemented; see [Boundaries](#boundaries).
 
-The contract is transport-neutral. It defines what a client and server may say to each other for one stream, not how bytes travel. Control message serialization (JSON, protobuf, or other) is chosen by endpoint adapters. Audio has a defined byte layout.
+The contract is transport-neutral. It defines what a client and server may say to each other for one stream, not how bytes travel. Control message serialization is chosen by endpoint adapters; the WebSocket adapter uses JSON (see [WebSocket adapter](#websocket-adapter)). Audio has a defined byte layout.
 
 ## Stream model
 
@@ -122,14 +122,16 @@ In this crate (`devl-server`):
 - `StreamContract`, a state machine with no I/O that validates client messages (`receive`) and server events (`emit`).
 - `Coordinator` and `StreamSession`: a worker pool that owns one `DevlSession` per stream, submits drafts and commits to `PriorityScheduler`, and releases credit. See [Coordinator](#coordinator).
 
+- `WsServer` and the JSON control encoding in `wire`: a WebSocket adapter over the coordinator. See [WebSocket adapter](#websocket-adapter).
+
 Not in this crate yet, each owned by later issues:
 
-- WebSocket/HTTP endpoint adapters and control message serialization.
+- HTTP endpoint adapter.
 - Backend integration and selection.
 - VAD and endpointing. Today the client decides when to `Commit`.
 - Authentication, TLS, rate limiting, and deployment.
 
-Dependencies: `devl-server` depends on `devl-core` (for `StreamId`) and `thiserror`. It has no async runtime or networking dependency, and `devl-core` is unchanged: protocol ownership, verification, rollback, and commit-over-draft scheduling remain there.
+Dependencies: `devl-server` depends on `devl-core` (for `StreamId`), `thiserror`, `serde`, `serde_json`, and `tungstenite` (handshake feature only, blocking I/O) for the WebSocket adapter. It has no async runtime, and `devl-core` is unchanged: protocol ownership, verification, rollback, and commit-over-draft scheduling remain there.
 
 ## Intended integration
 
@@ -154,3 +156,25 @@ Checkpoint cadence matters because encoding and verification run before the firs
 - **Teardown.** Cancel, close, disconnect (dropping the handle), final, error, and shutdown clear pending audio, remove the stream's queued jobs with `PriorityScheduler::cancel_stream`, drop the session (the worker does so if mid-job), and only then free the stream slot. A stream whose job is executing keeps its slot until the worker retires, so open-stream admission bounds queued and running work: with a worker gated on one stream, repeated open, commit, cancel, and reopen cannot grow the queues beyond the cap. An uncancellable running commit can therefore delay slot reuse until it returns. Pending `Partial` events are discarded when a terminal event is queued, and messages sent after the terminal event schedule nothing. Job permits are RAII and release on every path including panics, which fail only the affected stream with `internal`. Scheduler metadata for a stream is dropped when its last draft stops.
 - **Shutdown.** `Coordinator::shutdown` stops admission, fails open streams with `internal`, and joins the workers. `DevlSession::commit` has no preemption hook, so a commit already running finishes and its result is discarded. The same applies to a commit-phase `Cancel`.
 - **Draft errors.** A backend error inside a draft is non-fatal and emits nothing; the commit pass re-runs the work and reports any persistent failure.
+
+## WebSocket adapter
+
+`WsServer::bind(addr, Arc<Coordinator>, WsConfig)` listens on a TCP address and serves one stream per WebSocket connection. All stream decisions stay in the coordinator; the adapter parses frames, calls `StreamSession::send`, and forwards `try_recv_event` output. It is synchronous: one accept thread and one thread per connection, with no async runtime.
+
+### Framing
+
+- Control messages are text frames, one JSON object each, with a `type` field. Client types: `start` (`version{major,minor}`, `format{encoding: "s16le"|"f32le", sample_rate_hz, channels}`), `commit` (`frames`), `cancel`, `close`. Server types: `started` (`version`, `limits`), `credit` (`samples`), `partial` (`revision`, `audio_samples`, `text`), `final` (`audio_samples`, `text`), `cancelled`, `error` (`code`, `message`). Unknown extra fields on client messages are ignored.
+- Audio is a binary frame in the envelope above. One WebSocket message is one audio frame.
+- A message that is not valid JSON of a known type, or an undecodable binary frame, is `malformed_frame` (`unsupported_version` for a wrong envelope version).
+
+### Lifecycle
+
+A terminal event is followed by a WebSocket close frame (normal closure) and the server waits briefly for the client's reply. `close` from the client ends the connection after any `cancelled` event. A peer close or dropped connection is a disconnect and releases the stream without events. Protocol violations the adapter detects itself are answered with one `error` event (unless a terminal event already went out) and a close frame with code 1002 (protocol), 1007 (invalid payload), or 1009 (too big).
+
+### Bounds
+
+- `max_connections` caps simultaneous connections; extra TCP connections are closed before the handshake. The coordinator's `max_streams` is separate; a connection that cannot open a stream receives `error` code `internal` and is closed.
+- Inbound messages are capped at the larger of one maximal audio frame (`10 + 4 * max_frame_samples` bytes) and `max_text_bytes` (default 16 KiB). Larger messages are refused by the WebSocket layer, answered with `frame_too_large`, and closed with 1009. A frame within the byte cap but over `max_frame_samples` is `frame_too_large` from the coordinator.
+- Outbound buffering is the coordinator's bounded event queue plus a 64 KiB socket write buffer. A client that stops reading hits `write_timeout` and is disconnected.
+- `idle_timeout` closes a connection with no inbound message, except while the stream is committing.
+- `WsServer::shutdown` (also on drop) stops accepting, closes connections with 1001, and joins all adapter threads. The coordinator is shut down separately by its owner.

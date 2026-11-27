@@ -3,11 +3,11 @@
 //! This crate defines the versioned client/server message vocabulary, the
 //! binary audio framing, the per-stream limits, and a validating per-stream
 //! state machine ([`StreamContract`]). It performs no I/O, owns no async
-//! runtime, and contains no inference or verification logic. WebSocket/HTTP
-//! adapters, the scheduler coordinator, and backend integration are separate
-//! work that consume these types. The [`coordinator`] module is the first such
-//! consumer: it owns one `DevlSession` per stream and drives it through
-//! `PriorityScheduler`.
+//! runtime, and contains no inference or verification logic. The
+//! [`coordinator`] module owns one `DevlSession` per stream and drives it
+//! through `PriorityScheduler`. The [`ws`] module is a synchronous WebSocket
+//! adapter over the coordinator, with JSON control messages in [`wire`].
+//! HTTP adapters and backend integration are separate work.
 //!
 //! Protocol logic (verification, rollback, commit-over-draft scheduling)
 //! stays in `devl-core`. The contract only decides which messages are legal,
@@ -28,6 +28,8 @@ pub mod frame;
 pub mod limits;
 pub mod message;
 pub mod state;
+pub mod wire;
+pub mod ws;
 
 pub use coordinator::{
     Coordinator, CoordinatorConfig, CoordinatorError, CoordinatorStats, Detokenizer, StreamSession,
@@ -41,3 +43,4 @@ pub use message::{
     ServerEvent,
 };
 pub use state::{Accepted, StreamContract, StreamPhase};
+pub use ws::{WsConfig, WsServer};
