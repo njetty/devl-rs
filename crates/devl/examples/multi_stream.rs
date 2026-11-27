@@ -8,7 +8,8 @@ use std::time::Instant;
 use devl::{DevlSession, JobPriority, PriorityScheduler, SchedulerConfig, StreamId};
 use serde_json::json;
 use support::{
-    CHUNK_SAMPLES, Inputs, Result, SESSION_CONFIG, commit_record, emit, is_checkpoint, load_wav,
+    ArgsSpec, CHUNK_SAMPLES, Inputs, Result, SESSION_CONFIG, commit_record, emit, is_checkpoint,
+    load_wav,
 };
 
 enum Work {
@@ -17,7 +18,15 @@ enum Work {
 }
 
 fn main() -> Result<()> {
-    let inputs = Inputs::parse("multi_stream", 2, usize::MAX)?;
+    let inputs = Inputs::parse(
+        "multi_stream",
+        ArgsSpec {
+            min_files: 2,
+            max_files: usize::MAX,
+            allow_tokenizer: false,
+            allow_references: false,
+        },
+    )?;
     let (backend, model) = inputs.load_backend()?;
     let scheduler = PriorityScheduler::new(SchedulerConfig {
         max_concurrent_drafts: 1,
