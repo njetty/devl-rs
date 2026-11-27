@@ -10,7 +10,7 @@ For trait contracts, session invariants, and backend design details, see [docs/A
 
 ## v0.1.0 — Core Protocol & Whisper Local Backend
 
-Establish the runtime-agnostic DEVL protocol, priority scheduler, and a verified local Whisper backend over Candle with reproducible local benchmarking.
+Released on crates.io as [`devl-core` 0.1.0](https://crates.io/crates/devl-core/0.1.0), [`devl-candle` 0.1.0](https://crates.io/crates/devl-candle/0.1.0), and [`devl` 0.1.0](https://crates.io/crates/devl/0.1.0). This release establishes the runtime-agnostic DEVL protocol, priority scheduler, and local Candle Whisper backend with reproducible local benchmarking.
 
 ### Phase 1: Core Protocol, Scheduler, and Facade
 
@@ -32,7 +32,7 @@ Establish the runtime-agnostic DEVL protocol, priority scheduler, and a verified
 
 - Real-audio parity test suite validating exact greedy equivalence between streaming DEVL sessions and offline Whisper decoding on local fixtures.
 - Runnable workspace examples demonstrating single-stream sessions and multi-stream `PriorityScheduler` execution.
-- Reproducible local benchmark harness measuring TTFS, draft acceptance ratio, and WER with explicit recording of hardware, model, dtype, command, and commit SHA.
+- Reproducible local benchmark harness measuring TTFS, draft acceptance ratio, and exact token-match rate with explicit recording of hardware, model, dtype, command, and commit SHA.
 - Public API audit, rustdoc completeness check, packaging verification, and `v0.1.0` publication to crates.io.
 
 ---
