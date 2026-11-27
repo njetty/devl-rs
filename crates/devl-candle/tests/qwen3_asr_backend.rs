@@ -596,7 +596,30 @@ fn rollback_then_decode_matches_offline_greedy() {
         b.rollback_kv(&mut kv, draft.len()),
         Err(Qwen3AsrError::InvalidRollback { .. })
     ));
+    assert!(matches!(
+        b.rollback_kv(&mut kv, usize::MAX),
+        Err(Qwen3AsrError::InvalidRollback { .. })
+    ));
     assert_eq!(kv.len(), len);
+}
+
+#[test]
+fn decode_requires_the_verified_audio_encoding() {
+    let b = backend();
+    let first = b.encode_audio(&noise(22_000, 0.4, 12), None).unwrap();
+    let second = b.encode_audio(&noise(22_000, 0.4, 13), None).unwrap();
+    assert_eq!(first.audio_tokens(), second.audio_tokens());
+    let mut kv = b.new_kv_cache().unwrap();
+    let output = b.verify_draft(&first, &mut kv, &[]).unwrap();
+    let token = output.argmax_tokens[0];
+    let len = kv.len();
+
+    assert!(matches!(
+        b.decode_step(&second, &mut kv, token),
+        Err(Qwen3AsrError::StateMismatch(_))
+    ));
+    assert_eq!(kv.len(), len);
+    b.decode_step(&first.clone(), &mut kv, token).unwrap();
 }
 
 #[test]

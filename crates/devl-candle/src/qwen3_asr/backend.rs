@@ -198,6 +198,7 @@ struct FinalWindow {
 #[derive(Debug, Clone)]
 pub struct Qwen3AsrAudioEncoding {
     backend_id: u64,
+    identity: Arc<()>,
     /// Samples after the short-clip pad.
     samples: usize,
     audio_tokens: usize,
@@ -251,6 +252,7 @@ impl Qwen3AsrAudioEncoding {
 #[derive(Debug, Clone)]
 pub struct Qwen3AsrDecodeState {
     cache: Qwen3AsrKvCache,
+    encoding_identity: Option<Arc<()>>,
     /// Prompt length `P`, or `0` before the first `verify_draft`.
     prompt_len: usize,
 }
@@ -397,17 +399,14 @@ impl Qwen3AsrBackend {
         kv: &Qwen3AsrDecodeState,
     ) -> Result<(), Qwen3AsrError> {
         self.check_encoding(encoding)?;
-        if kv.prompt_len == 0 {
+        if !kv
+            .encoding_identity
+            .as_ref()
+            .is_some_and(|id| Arc::ptr_eq(id, &encoding.identity))
+        {
             return Err(Qwen3AsrError::StateMismatch(
-                "decoder state has no prompt (call verify_draft first)".into(),
+                "decoder state was not verified with this audio encoding".into(),
             ));
-        }
-        if kv.prompt_len != self.prompt_len(encoding.audio_tokens) {
-            return Err(Qwen3AsrError::StateMismatch(format!(
-                "decoder state prompt length {} does not match the encoding ({})",
-                kv.prompt_len,
-                self.prompt_len(encoding.audio_tokens)
-            )));
         }
         Ok(())
     }
@@ -472,6 +471,7 @@ impl DevlBackend for Qwen3AsrBackend {
     fn new_kv_cache(&self) -> Result<Self::KvCache, Self::Error> {
         Ok(Qwen3AsrDecodeState {
             cache: self.decoder.new_cache(),
+            encoding_identity: None,
             prompt_len: 0,
         })
     }
@@ -572,6 +572,7 @@ impl DevlBackend for Qwen3AsrBackend {
 
         Ok(Qwen3AsrAudioEncoding {
             backend_id: self.id,
+            identity: Arc::new(()),
             samples: pcm.len(),
             audio_tokens,
             floor,
@@ -614,7 +615,11 @@ impl DevlBackend for Qwen3AsrBackend {
             .then(|| logits.to_vec2::<f32>())
             .transpose()?;
 
-        *kv = Qwen3AsrDecodeState { cache, prompt_len };
+        *kv = Qwen3AsrDecodeState {
+            cache,
+            encoding_identity: Some(Arc::clone(&encoding.identity)),
+            prompt_len,
+        };
         Ok(VerifyOutput {
             argmax_tokens,
             logits,
@@ -622,15 +627,14 @@ impl DevlBackend for Qwen3AsrBackend {
     }
 
     fn rollback_kv(&self, kv: &mut Self::KvCache, accepted_len: usize) -> Result<(), Self::Error> {
-        let target = kv.prompt_len + accepted_len;
-        if kv.prompt_len == 0 || target > kv.cache.len() {
+        if kv.prompt_len == 0 || accepted_len > kv.cache.len().saturating_sub(kv.prompt_len) {
             return Err(Qwen3AsrError::InvalidRollback {
                 requested: accepted_len,
                 prompt_len: kv.prompt_len,
                 len: kv.cache.len(),
             });
         }
-        kv.cache.truncate(target)
+        kv.cache.truncate(kv.prompt_len + accepted_len)
     }
 
     fn decode_step(
