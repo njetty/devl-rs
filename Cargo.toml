@@ -4,6 +4,7 @@ members = [
     "crates/devl",
     "crates/devl-core",
     "crates/devl-candle",
+    "crates/devl-server",
 ]
 
 [workspace.package]

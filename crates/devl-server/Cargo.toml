@@ -1,0 +1,20 @@
+[package]
+name = "devl-server"
+description = "Transport-neutral streaming contract and per-stream protocol state for DEVL servers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["asr", "speech-recognition", "streaming", "devl"]
+categories = ["multimedia::audio", "network-programming"]
+# Unpublished until endpoint adapters land; the release workflow publishes the
+# three existing crates only.
+publish = false
+
+[dependencies]
+devl-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -18,7 +18,7 @@ DEVL converts offline speech recognition models into low-latency streaming recog
                           /             \
                          v               v (optional: candle / metal / cuda)
           +-------------------+     +-------------------+        +-------------------+
-          |     devl-core     | <-- |    devl-candle    | <----- | devl-server (v0.2)|
+          |     devl-core     | <-- |    devl-candle    | <----- | devl-server       |
           | (protocol, state, |     | (Candle Whisper   |        | (transport, VAD,  |
           |  scheduler, mock) |     |  backend)         |        |  HTTP/WS/gRPC)    |
           +-------------------+     +-------------------+        +-------------------+
@@ -40,8 +40,10 @@ DEVL converts offline speech recognition models into low-latency streaming recog
   - Depends on `devl-core`, `candle-core`, `candle-nn`, and `candle-transformers`, with optional `metal` and `cuda` feature flags.
   - Owns model loading, deterministic audio feature extraction, device placement, KV-cache management/truncation, and the `DevlBackend` implementation for local Whisper inference.
   - Must not re-implement prefix verification, rollback selection, draft loop orchestration, or commit-over-draft scheduling; all protocol logic lives in `devl-core`.
-- **`crates/devl-server`** (planned for v0.2; not scaffolded in v0.1):
-  - Will own network transport, connection/stream multiplexing, VAD/endpointing hooks, and telemetry, bridging client streams to `devl-core` and a chosen backend crate.
+- **`crates/devl-server`** (contract scaffold; unpublished):
+  - Depends on `devl-core` and `thiserror` only. No async runtime, networking, or backend dependencies yet.
+  - Owns the versioned streaming contract (message vocabulary, audio framing, limits, backpressure, cancellation) and a validating per-stream state machine. See [SERVER_CONTRACT.md](SERVER_CONTRACT.md).
+  - Planned, not implemented: endpoint adapters, the coordinator bridging streams to `DevlSession` and `PriorityScheduler`, backend selection, VAD/endpointing hooks, and telemetry. It must not duplicate verification, rollback, or scheduling logic from `devl-core`.
 
 ---
 
