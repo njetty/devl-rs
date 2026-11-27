@@ -1,0 +1,25 @@
+[package]
+name = "devl-candle"
+description = "Candle inference backend for devl-rs (Whisper and Qwen3-ASR on CPU, Metal, and CUDA)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["asr", "whisper", "candle", "streaming", "devl"]
+categories = ["algorithms", "multimedia::audio"]
+
+[features]
+default = []
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+
+[dependencies]
+devl-core.workspace = true
+candle-core.workspace = true
+candle-nn.workspace = true
+candle-transformers.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

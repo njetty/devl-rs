@@ -1,0 +1,24 @@
+[package]
+name = "devl"
+description = "Decode Early, Verify Late (DEVL) low-latency streaming ASR engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["asr", "speech-recognition", "streaming", "audio", "speculative-decoding"]
+categories = ["multimedia::audio", "algorithms"]
+
+[features]
+default = []
+candle = ["dep:devl-candle"]
+metal = ["candle", "devl-candle/metal"]
+cuda = ["candle", "devl-candle/cuda"]
+test-utils = ["devl-core/test-utils"]
+
+[dependencies]
+devl-core.workspace = true
+devl-candle = { workspace = true, optional = true }
+
+[lints]
+workspace = true

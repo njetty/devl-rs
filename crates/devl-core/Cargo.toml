@@ -1,0 +1,23 @@
+[package]
+name = "devl-core"
+description = "Runtime-agnostic core protocol, session state machine, and priority scheduler for DEVL (Decode Early, Verify Late)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["asr", "speech-recognition", "streaming", "speculative-decoding", "devl"]
+categories = ["algorithms", "multimedia::audio"]
+
+[features]
+default = []
+test-utils = []
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+devl-core = { path = ".", features = ["test-utils"] }
+
+[lints]
+workspace = true

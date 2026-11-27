@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/devl",
+    "crates/devl-core",
+    "crates/devl-candle",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/njetty/devl-rs"
+
+[workspace.dependencies]
+devl-core = { version = "0.1.0-alpha.1", path = "crates/devl-core" }
+devl-candle = { version = "0.1.0-alpha.1", path = "crates/devl-candle" }
+thiserror = "2.0"
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+
+[workspace.lints.clippy]
+all = "warn"
+
+# `gemm-f16` uses `#[inline]` FP16 inline assembly helpers invoked from
+# `#[target_feature(enable = "fp16")]` kernels; at `opt-level = 0` on
+# `aarch64-unknown-linux-gnu`, LLVM compiles those helpers standalone and
+# rejects the FP16 instructions. Optimizing `gemm-*` in dev builds fixes
+# debug compilation without requiring target-specific RUSTFLAGS.
+[profile.dev.package.gemm-f16]
+opt-level = 3
+
+[profile.dev.package.gemm-common]
+opt-level = 3
