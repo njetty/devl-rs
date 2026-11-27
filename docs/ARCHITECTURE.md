@@ -485,8 +485,10 @@ Input clip: mono, 16 kHz, at least 8000 samples, peak at most 1.0. For example `
 Command:
 
 ```bash
+mkdir -p out
 python qwen3_asr_reference.py --ckpt ckpt --wav clip.wav --out out/clip \
-  --dtype float32 --max-new-tokens 512 [--language English]
+  --dtype float32 --max-new-tokens 512
+# Append --language English for the forced-language run.
 ```
 
 `qwen3_asr_reference.py`:
@@ -561,7 +563,7 @@ Artifacts and how each is compared against the Rust backend (same clip, same dty
 | Positions | derived | The reference position of token `j` of the full sequence is `j` on every axis (`rope_deltas` must be `0`). Assert backend KV length equals `P` after prefill and `P + n` after `rollback_kv(kv, n)`, and that `decode_step` after rollback feeds position `P + n`. |
 | `mel.npy` | `.npy` | Elementwise comparison of the backend frontend output, shape `[128, F]`. Tolerances are to be set from measurements in the parity issue and recorded with hardware and commit. |
 | `audio_embeds.npy` | `.npy` | Elementwise comparison of the backend encoder output, shape `[N, 2048]`. Same tolerance policy. |
-| `argmax_margins` | `.json` | Used only to classify a token mismatch as a near-tie (small margin) versus a logic error (large margin). |
+| `argmax_margins` | `.json` | Used to investigate token mismatches. A small margin can indicate a numerical near-tie; a large margin warrants checking implementation and settings. |
 
 Run the reference twice per fixture: forced language and automatic language. For strict token parity use `--dtype float32` on both sides. A `bfloat16` run is a separate, looser comparison because bf16 logits make near-ties more likely (see Section 3, item 4).
 
@@ -630,12 +632,12 @@ Protocol-level mapping:
 
 None of these is implemented here. Each must be settled in the issue that needs it. Items marked "trait" would change `devl-core`, which this milestone's issue #22 does not authorize.
 
-- **D1, second stop token (trait).** The model stops on `151645` or `151643`. `DevlBackend::eos_token()` returns one id and `devl-core` compares with `==` (`session.rs` lines 397, 419, 441, 452). If the model ever emits `151643`, the session would not stop where upstream does. Options: (a) extend the trait with an EOS predicate or id set, defaulting to `token == eos_token()`; (b) keep one id and treat `151643` as unsupported, verifying on fixtures that it is not emitted. Recommendation: (b) for the first parity issue with an assertion in the reference tooling that generated ids contain no `151643` before the final token, and (a) if any fixture violates it.
+- **D1, second stop token (trait).** The model stops on `151645` or `151643`. `DevlBackend::eos_token()` returns one id and `devl-core` compares with `==` (`session.rs` lines 397, 419, 441, 452). If the model ever emits `151643`, the session would not stop where upstream does. Options: (a) extend the trait with an EOS predicate or id set, defaulting to `token == eos_token()`; (b) keep one id and treat `151643` as unsupported, verifying on fixtures that it is not emitted. Recommendation: (b) for the first parity issue with an assertion in the reference tooling that generated ids contain no `151643`, including at the final position, and (a) if any fixture violates it.
 - **D2, forced language (no trait change).** Language mode is fixed per backend instance or session and changes the prompt (and therefore `P`). It belongs in backend construction options. Changing it invalidates every cached block. Tokenizing `language <Name><asr_text>` for 30 names needs either the Qwen2 byte-level BPE (vocab, merges, and the regex fix noted in 6.5) or a verified id table. Decide which in the loader issue.
 - **D3, prior encoding validation (no trait change).** The trait accepts any `&AudioEncoding` as prior. The backend must store and check fingerprints (6.8). Decide the fingerprint (full compare of retained samples versus a hash).
 - **D4, supported duration bounds (no trait change).** Minimum 8000 samples (pad) and maximum 1200 s (`MAX_ASR_INPUT_SECONDS`) match upstream. At 13 tokens per second, 1200 s is 15600 audio tokens in one prefill. Decide whether v0.2.0 enforces a smaller cap and which `Error` variant reports it.
 - **D5, cached-state ownership (no trait change).** `AudioEncoding` will hold reference-counted per-block K/V. `new_kv_cache()` takes no encoding, so `verify_draft` performs the seeding. Confirm that `AudioEncoding: Send` (and `Sync` where `PriorityScheduler` shares it) holds for Candle tensors on all supported devices before choosing the representation.
-- **D6, pre-emption granularity (no trait change, scheduler note).** `encode_audio` and `verify_draft` run before the first `should_preempt` check (Section 4). With block prefill inside `encode_audio` the non-preemptible portion grows with new audio per checkpoint, not with clip length. No change is proposed, but checkpoint cadence should be documented in the server issue.
+- **D6, pre-emption granularity (no trait change, scheduler note).** `encode_audio` and `verify_draft` run before the first `should_preempt` check (Section 4). With a reusable prefix, encoder and prefix prefill work scales with uncached blocks. Whole-buffer mel and cache validation still scale with clip length, and invalidation can require rebuilding the entire prefix. No change is proposed, but checkpoint cadence should be documented in the server issue.
 - **D7, frontend reuse (no trait change).** The existing `mel.rs` pads to 30 s and supports 80 or 128 bins. Qwen3 needs a variable-length 128-bin frontend with the global-floor semantics of 6.3. Whether `candle_transformers` `pcm_to_mel` can be made to match without padding is unverified (see 6.12).
 
 ### 6.11 Consistency Check with Current Protocol Signatures
