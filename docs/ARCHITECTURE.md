@@ -423,6 +423,7 @@ Sources: `modeling` lines 309-317, 669-740, `config.json` audio config.
 - The mel sequence is split into chunks of `2 * n_window = 100` frames (1 s). Each chunk passes independently through three stride-2 convolutions (GELU after each), then `conv_out`, then the chunk-local sinusoidal position embedding (positions restart at 0 in every chunk).
 - A full 100-frame chunk yields 13 tokens. For `F` frames the encoder yields `N(F) = 13 * (F / 100) + g(F % 100)` tokens with integer division, where `g(r) = ((((r - 1) / 2 + 1) - 1) / 2 + 1 - 1) / 2 + 1` using floor division as written in `_get_feat_extract_output_lengths` (`g(0) = 0`). Audio runs at 13 tokens per second.
 - Self-attention in the 24 encoder layers is bidirectional inside a block and does not cross blocks. Block length is `13 * (n_window_infer / (2 * n_window)) = 104` tokens, which is 800 mel frames (8 s). The last block is shorter. After `ln_post`, `proj1`, GELU, and `proj2`, each token is a 2048-dimensional vector matching the decoder hidden size.
+- **Observed**: with the default `sdpa` attention implementation the upstream layer ignores `cu_seqlens` and attends over the whole clip. Only the `flash_attention_2` varlen path (or an explicit mask from `_prepare_attention_mask`) restricts attention to blocks. For clips longer than one block the two differ materially. See 6.13.
 - Therefore the output for any complete 8 s block depends only on the 800 mel frames of that block (plus the weights). The output for the trailing partial block depends on all of its frames and changes when frames are appended. Conv-chunk outputs are also independent per 1 s chunk, which permits an optional finer cache, but attention couples tokens within a block, so the block is the unit of reuse.
 
 ### 6.5 Prompt, Audio Placement, Language, and EOS (Upstream)
@@ -654,7 +655,122 @@ Checked against `crates/devl-core/src/backend.rs` and `session.rs` at the base o
 
 - The reference script was run on CPU in `float32` on one English clip, in automatic and forced-language modes. It has not been run on GPU, in `bfloat16`, or on clips longer than one 8 s block with a moving global maximum beyond the synthetic probe in 6.3.
 - Bitwise equality of block-wise prefill versus whole-prompt prefill in Candle is untested. Parity at the token level is the target. Numerical equality of embeddings and K/V is not promised.
-- Whether Candle's mel helper reproduces the torch path (centered reflect STFT, dropped last frame, global floor) within tolerance for variable-length input is unverified.
+- The Candle mel helper in `candle_transformers` was not used. A dedicated frontend reproduces the torch path within the tolerances in 6.13.
 - Tokenizer fidelity: the checkpoint ships `vocab.json` and `merges.txt` but no `tokenizer.json`, and loading emits a regex warning that upstream resolves with `fix_mistral_regex=True`. A Rust tokenizer for forced-language prompts has not been checked.
 - The second stop id `151643` behavior is untested beyond the single observed `151645` ending.
 - The upstream streaming path (`init_streaming_state` and `streaming_transcribe`, vLLM only) re-feeds all audio and prefixes the prompt with prior text minus a few tokens. It is a different heuristic that does not give the offline-exact guarantee, and it is not the reference for this project.
+
+### 6.13 Audio Frontend and Encoder Validation (Implemented)
+
+Implemented in `crates/devl-candle/src/qwen3_asr/` (`frontend`, `config`, `encoder`, `weights`). Scope is the audio path only: PCM to `[N, 2048]` embeddings. The decoder, prefix KV reuse, and the `DevlBackend` implementation are not part of it.
+
+Behavior:
+
+- Input checks: empty PCM, non-finite samples, samples outside `[-1.0, 1.0]`, and clips over 1200 s are rejected. Clips under 8000 samples are zero-padded at the tail to 8000. Out-of-range samples are rejected rather than peak-normalized, because upstream peak normalization would make earlier samples depend on later audio.
+- Frontend: `F = floor(S / 160)` frames, no padding to 30 s, global clamp floor `max - 8.0`. `Qwen3AsrMel` exposes the raw log10 values, the floor, and per-span minima for the invalidation rule in 6.8.
+- Encoder: chunks of 100 frames, a trailing partial chunk zero-padded to the longest chunk length of the clip before the convolutions (as upstream batches chunks), attention restricted to 800-frame windows, softmax in `f32`. `encode_window` returns one window and equals the matching rows of `encode_features`.
+- Loader: `from_checkpoint_dir` reads `config.json` and the shard index, then only `thinker.audio_tower.*` tensors with plain file I/O. No download and no `unsafe`.
+- Dtype: CPU `bfloat16` matmul is not supported by the pinned `candle-core` 0.11.1 (`unsupported dtype BF16 for op matmul`), so only `f32` was exercised. The encoder is dtype-generic and `bfloat16` on Metal or CUDA is untested.
+
+**Attention semantics finding.** The reference script in 6.7 runs the default `sdpa` implementation, which attends over the whole clip. This implementation follows the windowed semantics of 6.4, which the `flash_attention_2` path implements. For one-block clips both agree. For longer clips, embeddings and any tokens decoded from them differ between the two, so the reference used for a token-parity comparison must be chosen explicitly. The audio-only reference below produces both.
+
+Reference procedure (same pinned environment as 6.7, `float32`, CPU). `qwen3_asr_audio_reference.py` writes the mel features, windowed embeddings, and whole-clip-attention embeddings without running the decoder:
+
+```python
+import argparse, numpy as np, soundfile as sf, torch
+from qwen_asr import Qwen3ASRModel
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--ckpt", required=True)
+ap.add_argument("--wav", required=True)
+ap.add_argument("--out", required=True)
+args = ap.parse_args()
+
+asr = Qwen3ASRModel.from_pretrained(args.ckpt, dtype=torch.float32, device_map="cpu")
+wav, sr = sf.read(args.wav, dtype="float32", always_2d=False)
+assert sr == 16000 and wav.ndim == 1 and len(wav) >= 8000 and np.abs(wav).max() <= 1.0
+
+prompt = asr._build_text_prompt(context="", force_language=None)
+inputs = asr.processor(text=[prompt], audio=[wav], return_tensors="pt", padding=True)
+feats = inputs["input_features"].float()                      # [1, 128, F]
+lens = inputs["feature_attention_mask"].sum(-1)
+tower = asr.model.thinker.audio_tower
+
+def run(windowed):
+    # Default sdpa/eager attention ignores cu_seqlens and attends over the whole clip. The
+    # upstream helper _prepare_attention_mask builds the block-diagonal mask that the
+    # flash_attention_2 varlen path implements, so inject it to get windowed attention.
+    saved = []
+    if windowed:
+        for layer in tower.layers:
+            f = layer.forward
+            saved.append((layer, f))
+            layer.forward = (lambda h, cu, attention_mask=None, _f=f, **kw:
+                             _f(h, cu, attention_mask=tower._prepare_attention_mask(h, cu), **kw))
+    try:
+        with torch.no_grad():
+            return tower(feats[0][:, : lens[0]], feature_lens=lens[:1]).last_hidden_state.float().numpy()
+    finally:
+        for layer, f in saved:
+            layer.forward = f
+
+np.save(args.out + ".mel.npy", feats[0].numpy())
+np.save(args.out + ".audio_embeds.npy", run(True))           # block-windowed attention
+np.save(args.out + ".audio_embeds_global.npy", run(False))   # default sdpa, whole-clip attention
+```
+
+Fixtures: `full` is the English demo clip linked in the pinned checkpoint's model card, converted to 16 kHz mono PCM16 (240820 samples, one full window and one partial window). Prepare it with:
+
+```bash
+mkdir -p fixtures
+curl -fsSL https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_en.wav -o asr_en.wav
+ffmpeg -i asr_en.wav -ac 1 -ar 16000 -sample_fmt s16 fixtures/full.wav
+sha256sum fixtures/full.wav
+# bd5653f91260b80949a4d5053ac52cc58f26eb88f31768fd65112dd110e22035
+```
+
+Save the following as `mk.py` and run `python mk.py fixtures` to derive the remaining fixtures:
+
+```python
+import sys, numpy as np, soundfile as sf
+d = sys.argv[1]
+w, sr = sf.read(d + "/full.wav", dtype="float32"); assert sr == 16000
+sf.write(d + "/crop5s.wav", w[:80000], 16000, subtype="PCM_16")
+q = w.copy(); q[:128000] *= 0.05
+sf.write(d + "/quiet_head.wav", q, 16000, subtype="PCM_16")
+c = np.concatenate([w, q, w[:100000]])  # 15.05+15.05+6.25 s
+sf.write(d + "/long36s.wav", c, 16000, subtype="PCM_16")
+print(len(c), np.abs(c).max(), np.abs(w).max())
+```
+
+`mk.py` writes `crop5s` (500 frames, one partial window), `quiet_head` (first 8 s scaled by 0.05, so the global maximum moves into the second window), and `long36s` (full clip, then the `quiet_head` clip, then 6.25 s of the full clip: 3635 frames, four full windows and one partial). Generate the reference arrays and run the Rust comparison:
+
+```bash
+for name in full crop5s quiet_head long36s; do
+  python qwen3_asr_audio_reference.py --ckpt ckpt \
+    --wav "fixtures/$name.wav" --out "fixtures/$name"
+done
+
+DEVL_QWEN3_ASR_CKPT=ckpt DEVL_QWEN3_ASR_FIXTURES=fixtures \
+  cargo test -p devl-candle --release --test qwen3_asr_reference -- --nocapture
+```
+
+**Observed** (hardware: aarch64 Linux, Cortex-X925 and Cortex-A725 cores, CPU only; `rustc 1.100.0`; checkpoint revision and shard hashes from 6.1; `torch 2.8.0`, `transformers 4.57.6`; commit `dfbcbcf`). Errors are Candle `f32` versus the reference `f32`. `rel` is the maximum absolute embedding difference divided by the reference peak absolute value.
+
+| Fixture | Frames | Tokens | Windows | Mel max abs | Embedding max abs | Embedding rel | Min token cosine |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `full` | 1505 | 196 | 2 | 1.4e-5 | 3.4e-6 | 2.1e-5 | 1.00000000 |
+| `crop5s` | 500 | 65 | 1 | 1.4e-5 | 1.2e-6 | 7.5e-6 | 1.00000000 |
+| `quiet_head` | 1505 | 196 | 2 | 1.8e-5 | 8.6e-7 | 6.0e-6 | 1.00000000 |
+| `long36s` | 3635 | 473 | 5 | 5.5e-5 | 2.4e-6 | 1.4e-5 | 1.00000000 |
+
+Token counts equal `13 * (F / 100) + g(F % 100)` and the reference shapes. Against the whole-clip-attention embeddings the same implementation differs by 0.45 (`full`), 0.81 (`quiet_head`), and 0.91 (`long36s`) in `rel`, and matches at `1.2e-6` abs on the one-window `crop5s`. This confirms the finding above.
+
+Tolerances enforced by the opt-in test, set above the observed errors:
+
+| Dtype | Mel max abs | Embedding rel | Min token cosine |
+| --- | --- | --- | --- |
+| `f32` | 2e-4 | 2e-4 | 0.99999 |
+| `bfloat16` | not measured | not measured | not measured |
+
+The mel error is dominated by `f32` accumulation order in the reference and grows slowly with clip length. A `bfloat16` tolerance must be measured on a backend that supports it and is left to the parity issue.
