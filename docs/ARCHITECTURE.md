@@ -380,7 +380,7 @@ Per Section 2 (item 4) and Section 3 of arXiv:2611.20064v1, TTFS is minimized un
 
 ## 6. Qwen3-ASR Compatibility Contract (v0.2.0)
 
-This section fixes the model and offline reference contract for the planned Qwen3-ASR backend in `devl-candle`. Subsections 6.1 to 6.12 are a specification. 6.13 to 6.15 describe the implemented audio path, decoder, and backend. The only trait change is the defaulted `is_eos_token` method (D1, 6.15).
+This section fixes the model and offline reference contract for the planned Qwen3-ASR backend in `devl-candle`. Subsections 6.1 to 6.12 are a specification. 6.13 to 6.16 describe the implemented audio path, decoder, backend, and parity validation. The only trait change is the defaulted `is_eos_token` method (D1, 6.15).
 
 Conventions used below:
 
@@ -823,7 +823,7 @@ The clip was derived from the 48 kHz 24-bit demo recording by a 3-sample box ave
 | first 5 s | 80000 | 1 | 65 | 23 | `11528 6364 151704` | `151645` | 2.3e-5 |
 | full clip | 240819 | 2 | 196 | 49 | `11528 6364 151704` | `151645` | 3.2e-5 |
 
-Rollback was checked after keeping 0, 1, about half, and all but one generated tokens, and the decoded next id after each rollback equaled the id from the uninterrupted run. The full-clip row uses windowed audio attention on the resampled clip, while the upstream run quoted in 6.7 used whole-clip attention on the exact fixture and produced 48 ids. The one-id difference is not analyzed and is not evidence either way. Token parity against upstream on the 6.13 fixtures is left to the parity issue.
+Rollback was checked after keeping 0, 1, about half, and all but one generated tokens, and the decoded next id after each rollback equaled the id from the uninterrupted run. The full-clip row uses windowed audio attention on the resampled clip, while the upstream run quoted in 6.7 used whole-clip attention on the exact fixture and produced 48 ids. The one-id difference is not analyzed and is not evidence either way. Token parity against upstream on the 6.13 fixtures is covered in 6.16.
 
 ### 6.15 `DevlBackend` Integration (Implemented)
 
@@ -847,7 +847,7 @@ Implemented in `crates/devl-candle/src/qwen3_asr/backend.rs` as `Qwen3AsrBackend
 
 **Numerical caveat.** Prefix KV is produced by prefilling the prompt in pieces (prefix, then one window at a time) and the remainder in another call, so it is not bitwise equal to a single whole-prompt prefill. The synthetic tests bound the difference in logits and require equal tokens. The reuse path itself is bitwise equal to a fresh encode of the same audio, because it executes the same operations on the same shapes.
 
-**Tests.** `crates/devl-candle/tests/qwen3_asr_backend.rs` runs in CI with synthetic weights and a 40-frame window (8 tokens), using the real frontend. It covers: verification logits and offsets against a whole-prompt prefill for clips on both sides of the finality boundary and for empty and nonempty drafts; reuse when audio grows with an unchanged floor; a changed floor with an inactive clamp (reused, exact) and with an active clamp (rebuilt); altered samples inside each window; shorter, unrelated, and foreign priors; prior immutability and fork isolation; rollback to every valid length followed by resumed decode against offline greedy; both stop ids through `DevlSession` with and without promotion; session runs over growing audio against offline greedy; and error paths (empty, non-finite, out-of-range, too long, bad draft id, mismatched state, position limit, invalid configuration). `crates/devl-core/tests/multi_stop.rs` covers the predicate in the core loop and wrappers. Disabling the floor check or the sample comparison makes the corresponding tests fail. `tests/qwen3_asr_backend_reference.rs` is an opt-in smoke test (`DEVL_QWEN3_ASR_CKPT`, `DEVL_QWEN3_ASR_WAV`) that checks session output against the backend's own offline decode and window reuse on a real clip. It is not an upstream parity test, which is left to the parity issue.
+**Tests.** `crates/devl-candle/tests/qwen3_asr_backend.rs` runs in CI with synthetic weights and a 40-frame window (8 tokens), using the real frontend. It covers: verification logits and offsets against a whole-prompt prefill for clips on both sides of the finality boundary and for empty and nonempty drafts; reuse when audio grows with an unchanged floor; a changed floor with an inactive clamp (reused, exact) and with an active clamp (rebuilt); altered samples inside each window; shorter, unrelated, and foreign priors; prior immutability and fork isolation; rollback to every valid length followed by resumed decode against offline greedy; both stop ids through `DevlSession` with and without promotion; session runs over growing audio against offline greedy; and error paths (empty, non-finite, out-of-range, too long, bad draft id, mismatched state, position limit, invalid configuration). `crates/devl-core/tests/multi_stop.rs` covers the predicate in the core loop and wrappers. Disabling the floor check or the sample comparison makes the corresponding tests fail. `tests/qwen3_asr_backend_reference.rs` is an opt-in smoke test (`DEVL_QWEN3_ASR_CKPT`, `DEVL_QWEN3_ASR_WAV`) that checks session output against the backend's own offline decode and window reuse on a real clip. It is not an upstream parity test. The parity test is described in 6.16.
 
 
 **Observed** (hardware: aarch64 Linux, Cortex-X925 and Cortex-A725 cores, CPU only; `rustc 1.100.0`; `f32`; checkpoint revision and shard sha256 values from 6.1, verified; code commit `22c2363`). Command:
@@ -862,4 +862,92 @@ DEVL_QWEN3_ASR_CKPT=ckpt DEVL_QWEN3_ASR_WAV=clip.wav \
 | 15 s English clip, 3-sample box average to 16 kHz (as in 6.14) | 240819 | 196 | 1 | 8 | 49, ending in `151645` | equals offline greedy with and without promotion, windows reused |
 | 36 s concatenation, local copy of the `long36s` clip of 6.13 | 581640 | 473 | 4 | 19 | 113 | equals offline greedy with and without promotion, windows reused |
 
-Drafts are taken every 2 s of buffered audio, so later drafts verify the previous draft against a new encoding with reused windows and prefix KV. The comparison is the backend against itself (session protocol versus offline greedy decode of the whole clip), run with block-windowed audio attention. It is not parity with upstream token ids, which is left to the parity issue. Wall-clock times were not recorded because other builds shared the machine. Neither clip exceeds 36 s, so nothing in this table supports behavior near the 120 s default cap or the 1200 s frontend limit. The first clip is the one used in 6.14. The local `long36s` copy was not checked against the sha256 of the 6.13 fixture.
+Drafts are taken every 2 s of buffered audio, so later drafts verify the previous draft against a new encoding with reused windows and prefix KV. The comparison is the backend against itself (session protocol versus offline greedy decode of the whole clip), run with block-windowed audio attention. It is not parity with upstream token ids, which is covered in 6.16. Wall-clock times were not recorded because other builds shared the machine. Neither clip exceeds 36 s, so nothing in this table supports behavior near the 120 s default cap or the 1200 s frontend limit. The first clip is the one used in 6.14. The local `long36s` copy was not checked against the sha256 of the 6.13 fixture.
+
+### 6.16 Offline Greedy Parity Validation (Implemented)
+
+Scope: exact token comparison of `Qwen3AsrBackend` against the pinned upstream model, on the offline path and on the streaming path, including cache reuse and cache invalidation. No library code changed. The deterministic CI coverage is in `tests/qwen3_asr_backend.rs` and the opt-in real-checkpoint test is `tests/qwen3_asr_parity_reference.rs`.
+
+**Reference selection.** The reference is upstream whole-prompt offline greedy decoding with **block-windowed audio attention**: attention inside 800-frame windows and not across them, which is the `flash_attention_2` varlen semantics of 6.4 and the behavior this encoder implements (6.13). The upstream default `sdpa` implementation attends over the whole clip for multi-window audio and is a different computation. It is recorded for contrast and is never a pass criterion. `tests/tools/qwen3_asr_parity_reference.py` produces both modes from the same pinned environment, injecting the upstream helper `_prepare_attention_mask` to obtain the windowed mode without flash-attn.
+
+**Matched settings.** `float32`, CPU, greedy (no sampling, one beam), no logit suppression, empty context, no forced language, `max_new_tokens` 512 upstream and `SessionConfig::max_tokens` 512 in Rust, stop on `151645` or `151643` (raw ids compared, the stop id included). Audio is 16 kHz mono PCM16 read as `f32 / 32768`, identical bytes on both sides. The test also checks the sample count, the audio token count `N`, and the prompt length `15 + N` against the reference record.
+
+**CI coverage (no weights).** All of these assert tokens equal to offline greedy:
+
+| Requirement | Test |
+| --- | --- |
+| Window reuse and prefix KV reuse across drafts | `session_reuses_final_windows_and_leaves_partial_windows_uncached` (call log shows reused windows, no rebuilt window, zero prefix tokens re-prefilled), `growing_audio_reuses_final_windows_and_prefix_kv`, `unchanged_audio_reuses_everything_and_prior_is_not_mutated` |
+| Normalization invalidation | `session_rebuilds_windows_when_later_audio_moves_the_normalization_floor` (floor moves, stale windows rebuilt, earlier windows still reused), `floor_change_with_active_clamp_invalidates_and_rebuilds`, `floor_change_with_inactive_clamp_keeps_windows_and_stays_exact` |
+| Partial windows | the same session test (a non-final tail is encoded and never cached), `finality_boundary_decides_cached_windows`, `verify_matches_whole_prompt_prefill_for_every_window_layout` |
+| Draft mismatch, rollback, resume | `rejected_draft_rolls_back_and_resumes_to_offline_greedy_on_reused_windows` (a seeded draft rejected at index 0, 1, 3, and the last, committed over an encoding that reuses windows, with the rollback length, accepted prefix, and resumed step count asserted), `rollback_then_decode_matches_offline_greedy` |
+| Whole sessions | `session_with_growing_audio_matches_offline_greedy` |
+
+`tests/common/mod.rs` provides a recording wrapper that forwards every `DevlBackend` call, including `is_eos_token`, and logs encodes, verifies, rollbacks, and decode steps. It makes reuse, invalidation, and rejection observable because the session does not expose its encodings or drafts.
+
+**Real-checkpoint procedure.** Environment, checkpoint, and fixtures as in 6.1, 6.7, and 6.13 (`ckpt`, the pinned venv, `fixtures/full.wav` with the sha256 in 6.13).
+
+```bash
+# 1. Derive crop5s, quiet_head, long36s, rising36s from full.wav
+python crates/devl-candle/tests/tools/qwen3_asr_make_fixtures.py fixtures
+
+# 2. Upstream references: writes <name>.windowed.json and <name>.global.json
+for n in crop5s full quiet_head long36s rising36s; do
+  python crates/devl-candle/tests/tools/qwen3_asr_parity_reference.py \
+    --ckpt ckpt --wav "fixtures/$n.wav" --out "fixtures/$n"
+done
+
+# 3. Rust comparison (the directory holds the .wav and .json files)
+DEVL_QWEN3_ASR_CKPT=ckpt DEVL_QWEN3_ASR_PARITY_DIR=fixtures \
+  cargo test -p devl-candle --release --test qwen3_asr_parity_reference -- --nocapture
+```
+
+Optional: `DEVL_QWEN3_ASR_PARITY_NAMES=full,quiet_head` selects fixtures and `DEVL_QWEN3_ASR_PARITY_CHUNK_SECONDS` sets the draft cadence (default 2 s). Without the two required variables the test prints a skip line and passes. The test needs about 8 GiB of memory for the `f32` weights and the python reference about 7 GiB, so run them one after the other on a small machine. A full run took about 21 minutes on the machine below.
+
+For each fixture the test prints the first differing index (if any), both tokens, the upstream top-2 margin, the Rust logit gap between the two tokens, the shared prefix, and the cache counters of every streaming run. It fails on any difference from the windowed reference, and fails if a fixture built to exercise a cache path (`full`, `quiet_head`, `long36s`, `rising36s` must reuse windows, `quiet_head` and `rising36s` must rebuild some) did not.
+
+**Fixtures.** `full` is the demo clip of 6.13. The others are derived by `qwen3_asr_make_fixtures.py`. The derived files were regenerated from `full.wav` and were byte identical to the first copies.
+
+| Fixture | Content | Samples | Audio tokens | sha256 |
+| --- | --- | --- | --- | --- |
+| `crop5s` | first 5 s of `full` | 80000 | 65 | `17d8913ac695d02cbe4f5caf8bc8e018a25790b6aaa1efe729154dd7a4eecb92` |
+| `full` | demo clip | 240820 | 196 | `bd5653f91260b80949a4d5053ac52cc58f26eb88f31768fd65112dd110e22035` |
+| `quiet_head` | `full` with the first 8 s scaled by 0.05 | 240820 | 196 | `932070c0d461a7e6182ea7c2e4d45956e6042a06170554e40b7a787613ab3b02` |
+| `long36s` | `full`, `quiet_head`, first 6.25 s of `full` | 581640 | 473 | `efbbb0994cf8520f1d8fcf9f6a4234758f266540383e158e43776a8f548a2d30` |
+| `rising36s` | `full` scaled by 0.05, `full`, first 6.25 s of `full` | 581640 | 473 | `41d8177957e8d330ee6932030ca586fca2546e9fb5ac1cbe6657ca7af65b998e` |
+
+**Observed** (hardware: aarch64 Linux 7.0, Cortex-X925 and Cortex-A725 cores, CPU only; `rustc 1.100.0`; Candle `f32`; checkpoint revision and shard sha256 values as in 6.1, verified for the shards used; reference `torch 2.8.0`, `transformers 4.57.6`, `qwen-asr 0.0.6`, `float32`, CPU; Rust code at base `6b5dab4` plus the test files of this change, library sources unchanged; command as in step 3).
+
+| Fixture | Upstream ids (windowed) | Rust offline greedy | Streaming commit, no promotion | Streaming commit, promotion | Smallest upstream margin (index) |
+| --- | --- | --- | --- | --- | --- |
+| `crop5s` | 22 | equal | equal | equal | 0.5356 (3) |
+| `full` | 48 | equal | equal | equal | 0.0431 (33) |
+| `quiet_head` | 49 | equal | equal | equal | 0.7172 (3) |
+| `long36s` | 113 | equal | equal | equal | 0.5645 (22) |
+| `rising36s` | 113 | equal | equal | equal | 0.1028 (3) |
+
+Every sequence ends in `151645` and none contains `151643`. Margins are upstream top-2 logit differences at each generated position.
+
+Cache paths exercised by the streaming runs (drafts every 2 s of buffered audio, so every run drafts on a growing buffer and every draft after the first is verified against the previous draft). A floor change does not by itself force a rebuild (6.8), so `full` and `long36s` show one change and no rebuilt window. Counts are final windows taken over from the prior encoding (reused), prior final windows rebuilt (rebuilt), and encodes whose clamp floor differed from the prior's (floor changes). Each run's verifies include several rejected drafts (7 of 9 for `full`, 18 of 20 for `long36s`), each followed by rollback and resumed decoding, and every run committed with zero further decode steps because the final draft already matched.
+
+| Fixture | Promotion | Encodes | Reused | Rebuilt | Floor changes | Final windows |
+| --- | --- | --- | --- | --- | --- | --- |
+| `crop5s` | off / on | 4 / 3 | 0 / 0 | 0 / 0 | 1 / 1 | 0 |
+| `full` | off / on | 9 / 8 | 4 / 3 | 0 / 0 | 1 / 1 | 1 |
+| `quiet_head` | off / on | 9 / 8 | 3 / 2 | 1 / 1 | 3 / 3 | 1 |
+| `long36s` | off / on | 20 / 19 | 36 / 32 | 0 / 0 | 1 / 1 | 4 |
+| `rising36s` | off / on | 20 / 19 | 34 / 30 | 2 / 2 | 3 / 3 | 4 |
+
+`quiet_head` and `rising36s` are the invalidation paths: a quiet start sets a low floor, later loud audio raises it, the quiet windows clamp under the new floor, and they and every window after them are rebuilt. `full` and `long36s` are the unchanged-normalization reuse paths (the maximum lies in the first clip). `crop5s` is shorter than one window and caches nothing, so it exercises the partial window path only. Wall-clock times were printed by the test and are not recorded here because they depend on the shared machine.
+
+**Divergence.** None between Rust and the windowed reference. As a numerical cross-check, the Rust top-2 margin at the position of the smallest upstream margin agrees with the upstream value (`full` index 33: upstream 0.0431, Rust 0.043118; `long36s` index 22: upstream 0.5645, Rust 0.564457). The smallest margin in the set is 0.0431 (`full`), so the exact match there is also within a near tie, and only `f32` CPU was tested.
+
+**Contrast with whole-clip attention.** The upstream `sdpa` references differ from the windowed ones on three fixtures: `full` (first difference at index 33, upstream whole-clip top-2 margin 0.0454, Rust gap 0.0431 in favor of its own token), `quiet_head` (index 3, Rust gap 3.99), and `long36s` (index 22, upstream whole-clip margin 0.0944, Rust gap 0.5645). They are identical on `crop5s` (one window) and on `rising36s`, where the two attention modes happened to decode the same ids. The Rust backend matches the windowed reference exactly in all five cases, so a comparison against the default `sdpa` output is not a valid parity check for multi-window clips.
+
+**Limits.**
+
+- Only `f32` on CPU was run. `bfloat16` is untested, and CPU `bfloat16` matmul is unsupported by the pinned Candle (6.13). No GPU run.
+- One checkpoint revision, one English speaker, five clips of at most 36.3 s, empty context, no forced language. The 120 s default cap and the 1200 s limit are not exercised.
+- Equality of tokens is not equality of logits. Cached prefix KV is built by prefilling in pieces, so it is not bitwise equal to one whole-prompt prefill (6.15). Exact token equality can break at a near tie on other audio, hardware, or dtype, and the test prints the margin so such a case can be analyzed instead of dismissed.
+- The streaming path here is the offline-exact DEVL protocol. The upstream vLLM streaming heuristic (6.12) is not compared.
+- The drafts are taken at a fixed 2 s cadence and are not a model of server endpointing, which belongs to `devl-server`.
+- The reference records the token ids from `generate`, not the post-processed text of `parse_asr_output`.
