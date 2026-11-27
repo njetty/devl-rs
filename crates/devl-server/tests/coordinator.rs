@@ -839,6 +839,9 @@ fn scheduler_metadata_does_not_grow_per_completed_stream() {
         s.send(&ClientMessage::Cancel).unwrap();
     }
     wait_open_streams(&c, 0);
+    // The registry retires the stream before the worker drops its scheduler permit.
+    // Join the workers before asserting final scheduler counters.
+    c.shutdown();
     let s = c.stats();
     assert_eq!(s.tracked_streams, 0);
     assert_eq!(
