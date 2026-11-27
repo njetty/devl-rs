@@ -169,12 +169,13 @@ Checkpoint cadence matters because encoding and verification run before the firs
 
 ### Lifecycle
 
-A terminal event is followed by a WebSocket close frame (normal closure) and the server waits briefly for the client's reply. `close` from the client ends the connection after any `cancelled` event. A peer close or dropped connection is a disconnect and releases the stream without events. Protocol violations the adapter detects itself are answered with one `error` event (unless a terminal event already went out) and a close frame with code 1002 (protocol), 1007 (invalid payload), or 1009 (too big).
+A terminal event is followed by a WebSocket close frame (normal closure) and the server waits briefly for the client's reply. `close` from the client ends the connection after any `cancelled` event. A peer close frame is answered with a flushed close reply, and a dropped connection is a disconnect; both release the stream without events. Every closing handshake is bounded in total by `close_timeout`. Protocol violations the adapter detects itself are answered with one `error` event (unless a terminal event already went out) and a close frame with code 1002 (protocol), 1007 (invalid payload), or 1009 (too big).
 
 ### Bounds
 
 - `max_connections` caps simultaneous connections; extra TCP connections are closed before the handshake. The coordinator's `max_streams` is separate; a connection that cannot open a stream receives `error` code `internal` and is closed.
 - Inbound messages are capped at the larger of one maximal audio frame (`10 + 4 * max_frame_samples` bytes) and `max_text_bytes` (default 16 KiB). Larger messages are refused by the WebSocket layer, answered with `frame_too_large`, and closed with 1009. A frame within the byte cap but over `max_frame_samples` is `frame_too_large` from the coordinator.
-- Outbound buffering is the coordinator's bounded event queue plus a 64 KiB socket write buffer. A client that stops reading hits `write_timeout` and is disconnected.
+- `handshake_timeout` is an absolute deadline for the whole opening handshake, measured from accept on a monotonic clock, so a peer sending bytes slowly cannot hold a connection slot past it. Shutdown interrupts a handshake in progress within one `poll_interval`.
+- Outbound buffering is the coordinator's bounded event queue plus a 64 KiB socket write buffer. A client that stops reading hits `write_timeout` and is disconnected. `write_timeout` bounds each blocking write call, not a whole message or connection.
 - `idle_timeout` closes a connection with no inbound message, except while the stream is committing.
 - `WsServer::shutdown` (also on drop) stops accepting, closes connections with 1001, and joins all adapter threads. The coordinator is shut down separately by its owner.

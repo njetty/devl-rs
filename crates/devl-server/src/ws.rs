@@ -23,8 +23,16 @@
 //!   (`FRAME_HEADER_LEN + 4 * max_frame_samples` bytes) and
 //!   [`WsConfig::max_text_bytes`]; the WebSocket layer refuses anything larger
 //!   before buffering it.
+//! * The opening handshake has an absolute deadline of
+//!   [`WsConfig::handshake_timeout`], measured from accept on a monotonic
+//!   clock. It covers every read and write of the handshake, so a peer that
+//!   dribbles bytes cannot hold a connection slot past it, and server
+//!   shutdown interrupts a handshake in progress within one
+//!   [`WsConfig::poll_interval`].
 //! * Outbound traffic is the coordinator's bounded event queue; a client that
 //!   stops reading hits [`WsConfig::write_timeout`] and is disconnected.
+//!   `write_timeout` bounds each blocking write call, not a whole message
+//!   or connection.
 //! * A connection with no inbound message for [`WsConfig::idle_timeout`]
 //!   (except while waiting for a final) is closed.
 //!
@@ -35,8 +43,11 @@
 //! releases the stream's pending audio, scheduler jobs, and session. Errors
 //! the contract did not see (undecodable frames, oversized messages) are
 //! reported with one `error` event if no terminal event was already sent.
+//! A peer `Close` is answered with a flushed close reply, and every closing
+//! handshake (ours or the peer's) is bounded by [`WsConfig::close_timeout`] in
+//! total, with writes during it capped at the same value.
 
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -64,14 +75,16 @@ pub struct WsConfig {
     pub max_text_bytes: usize,
     /// Socket read timeout; also the event-drain cadence of a connection.
     pub poll_interval: Duration,
-    /// Time allowed for the opening handshake.
+    /// Absolute time allowed for the whole opening handshake, from accept.
     pub handshake_timeout: Duration,
-    /// Time allowed for one outbound write before the client is dropped.
+    /// Time allowed for one blocking outbound write call before the client is
+    /// dropped. This is a per-operation bound, not a deadline for a message.
     pub write_timeout: Duration,
     /// Inbound silence after which a connection is closed. Not applied while
     /// the stream is committing, since the client then waits on the server.
     pub idle_timeout: Duration,
-    /// Time a finished connection waits for the peer's close reply.
+    /// Total time a closing handshake may take, including flushing our close
+    /// frame and waiting for the peer's reply.
     pub close_timeout: Duration,
 }
 
@@ -229,6 +242,77 @@ where
     }
 }
 
+/// A socket whose reads and writes honour an optional absolute deadline and
+/// the server's stop flag. With no deadline it is a plain pass-through.
+///
+/// Used so the opening handshake can be bounded in total (the OS timeout is
+/// per call) and interrupted by shutdown.
+struct Conn {
+    tcp: TcpStream,
+    /// Absolute handshake deadline; `None` once the handshake is done.
+    deadline: Option<Instant>,
+    shared: Arc<Shared>,
+    poll: Duration,
+    write_timeout: Duration,
+}
+
+impl Conn {
+    fn remaining(&self) -> io::Result<Option<Duration>> {
+        match self.deadline {
+            None => Ok(None),
+            Some(d) => d
+                .checked_duration_since(Instant::now())
+                .filter(|r| !r.is_zero())
+                .map(Some)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "handshake deadline")),
+        }
+    }
+
+    fn interrupted(&self) -> io::Result<()> {
+        if self.deadline.is_some() && self.shared.stopping.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "server stopping",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.deadline.is_none() {
+            return self.tcp.read(buf);
+        }
+        loop {
+            self.interrupted()?;
+            let slice = self.remaining()?.map_or(self.poll, |r| r.min(self.poll));
+            self.tcp.set_read_timeout(Some(slice))?;
+            match self.tcp.read(buf) {
+                Err(e) if is_timeout(&e) => {}
+                other => return other,
+            }
+        }
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.deadline.is_some() {
+            self.interrupted()?;
+            let slice = self
+                .remaining()?
+                .map_or(self.write_timeout, |r| r.min(self.write_timeout));
+            self.tcp.set_write_timeout(Some(slice))?;
+        }
+        self.tcp.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
 fn is_timeout(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -241,6 +325,8 @@ enum Exit {
     /// A terminal event was delivered or the client sent `Close`; do the
     /// closing handshake.
     Finished,
+    /// The peer sent a WebSocket close frame; flush our reply.
+    PeerClosed,
     /// The peer is gone or the transport failed; nothing more can be sent.
     Gone,
     /// The server is stopping.
@@ -249,7 +335,7 @@ enum Exit {
     Code(CloseCode),
 }
 
-fn serve_connection<B>(stream: TcpStream, shared: &Shared, coordinator: &Coordinator<B>)
+fn serve_connection<B>(stream: TcpStream, shared: &Arc<Shared>, coordinator: &Coordinator<B>)
 where
     B: DevlBackend + Clone + Send + Sync + 'static,
     B::AudioEncoding: Send,
@@ -257,25 +343,29 @@ where
     let cfg = &shared.config;
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_nodelay(true);
-    if stream
-        .set_read_timeout(Some(cfg.handshake_timeout))
-        .is_err()
-        || stream.set_write_timeout(Some(cfg.write_timeout)).is_err()
-    {
+    let Some(deadline) = Instant::now().checked_add(cfg.handshake_timeout) else {
         return;
-    }
+    };
+    let conn = Conn {
+        tcp: stream,
+        deadline: Some(deadline),
+        shared: Arc::clone(shared),
+        poll: cfg.poll_interval.max(Duration::from_millis(1)),
+        write_timeout: cfg.write_timeout,
+    };
     let ws_cfg = WebSocketConfig::default()
         .max_message_size(Some(shared.max_message_bytes))
         .max_frame_size(Some(shared.max_message_bytes))
         .write_buffer_size(0)
         .max_write_buffer_size(64 * 1024);
-    let Ok(mut ws) = tungstenite::accept_with_config(stream, Some(ws_cfg)) else {
+    let Ok(mut ws) = tungstenite::accept_with_config(conn, Some(ws_cfg)) else {
         return;
     };
-    if ws
-        .get_ref()
-        .set_read_timeout(Some(cfg.poll_interval))
-        .is_err()
+    // Handshake done: drop the deadline and switch to per-call timeouts.
+    ws.get_mut().deadline = None;
+    let tcp = &ws.get_ref().tcp;
+    if tcp.set_read_timeout(Some(cfg.poll_interval)).is_err()
+        || tcp.set_write_timeout(Some(cfg.write_timeout)).is_err()
     {
         return;
     }
@@ -298,7 +388,9 @@ where
         last_inbound: Instant::now(),
     };
     match conn.run() {
-        Exit::Finished => close(&mut conn.ws, CloseCode::Normal, cfg.close_timeout),
+        Exit::Finished | Exit::PeerClosed => {
+            close(&mut conn.ws, CloseCode::Normal, cfg.close_timeout);
+        }
         Exit::Stopping => close(&mut conn.ws, CloseCode::Away, cfg.close_timeout),
         Exit::Code(code) => close(&mut conn.ws, code, cfg.close_timeout),
         Exit::Gone => {}
@@ -311,7 +403,7 @@ where
     B: DevlBackend + Clone + Send + Sync + 'static,
     B::AudioEncoding: Send,
 {
-    ws: WebSocket<TcpStream>,
+    ws: WebSocket<Conn>,
     session: StreamSession<B>,
     shared: &'a Shared,
     terminal_sent: bool,
@@ -361,7 +453,8 @@ where
                     }
                 }
                 Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
-                Ok(Message::Close(_)) => return Exit::Gone,
+                // tungstenite queued the close reply; `close` flushes it.
+                Ok(Message::Close(_)) => return Exit::PeerClosed,
                 Err(tungstenite::Error::Io(e)) if is_timeout(&e) => {}
                 Err(tungstenite::Error::Capacity(_)) => {
                     return self.reject(
@@ -426,16 +519,24 @@ where
     }
 }
 
-fn send_event(
-    ws: &mut WebSocket<TcpStream>,
-    event: &ServerEvent,
-) -> Result<(), tungstenite::Error> {
+fn send_event(ws: &mut WebSocket<Conn>, event: &ServerEvent) -> Result<(), tungstenite::Error> {
     ws.send(Message::text(encode_server_event(event)))
 }
 
 /// Send a close frame and give the peer a bounded time to answer, so a
 /// well-behaved client reads every queued event before the socket closes.
-fn close(ws: &mut WebSocket<TcpStream>, code: CloseCode, wait: Duration) {
+///
+/// The whole exchange is bounded by `wait`: writes are capped at `wait` and
+/// the reply loop ends at an absolute deadline, whatever the peer sends. When
+/// the peer closed first this flushes tungstenite's queued reply instead.
+fn close(ws: &mut WebSocket<Conn>, code: CloseCode, wait: Duration) {
+    let Some(deadline) = Instant::now().checked_add(wait) else {
+        return;
+    };
+    let cap = wait
+        .max(Duration::from_millis(1))
+        .min(ws.get_ref().write_timeout);
+    let _ = ws.get_ref().tcp.set_write_timeout(Some(cap));
     let frame = CloseFrame {
         code,
         reason: "".into(),
@@ -443,7 +544,6 @@ fn close(ws: &mut WebSocket<TcpStream>, code: CloseCode, wait: Duration) {
     if ws.close(Some(frame)).is_err() {
         return;
     }
-    let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
         match ws.read() {
             Ok(_) => {}

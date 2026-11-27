@@ -545,3 +545,115 @@ fn shutdown_closes_connections_and_joins() {
         }
     );
 }
+
+/// Open a raw TCP connection and send one byte of a handshake every `gap`
+/// until the server closes it. Returns how long the server kept it.
+fn dribble_until_closed(addr: std::net::SocketAddr, gap: Duration, limit: Duration) -> Duration {
+    use std::io::{Read, Write};
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(1))).unwrap();
+    let start = Instant::now();
+    // A request that never finishes: valid header lines, one byte at a time.
+    let head = b"GET / HTTP/1.1\r\nHost: x\r\n";
+    let pad = b"X: a\r\n";
+    let mut i = 0;
+    while start.elapsed() < limit {
+        let mut b = [0u8; 16];
+        match s.read(&mut b) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+        }
+        let byte = head
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| pad[(i - head.len()) % pad.len()]);
+        i += 1;
+        if s.write_all(&[byte]).is_err() {
+            break;
+        }
+        thread::sleep(gap);
+    }
+    start.elapsed()
+}
+
+#[test]
+fn handshake_deadline_is_total_and_reclaims_slots() {
+    let timeout = Duration::from_millis(300);
+    let f = fixture_with(
+        MockBackend::new(),
+        coordinator_config(),
+        WsConfig {
+            max_connections: 1,
+            handshake_timeout: timeout,
+            ..WsConfig::default()
+        },
+    );
+    // Each byte arrives well inside the per-read timeout, so only a total
+    // deadline can end this connection.
+    let held = dribble_until_closed(f.server.local_addr(), Duration::from_millis(100), WAIT);
+    assert!(held >= timeout, "closed early: {held:?}");
+    assert!(held < timeout * 5, "deadline not enforced: {held:?}");
+    f.assert_retired();
+
+    // The single slot is usable again and a real stream runs end to end.
+    let mut ws = f.connect();
+    open(&mut ws);
+    send_json(&mut ws, json!({"type":"cancel"}));
+    assert_eq!(finish(&mut ws)["type"], "cancelled");
+    f.assert_retired();
+}
+
+#[test]
+fn shutdown_interrupts_a_slow_handshake() {
+    let f = fixture_with(
+        MockBackend::new(),
+        coordinator_config(),
+        WsConfig {
+            handshake_timeout: Duration::from_secs(60),
+            ..WsConfig::default()
+        },
+    );
+    let addr = f.server.local_addr();
+    let h = thread::spawn(move || {
+        dribble_until_closed(addr, Duration::from_millis(100), Duration::from_secs(10))
+    });
+    let start = Instant::now();
+    while f.server.active_connections() == 0 {
+        assert!(start.elapsed() < WAIT, "handshake never started");
+        thread::sleep(Duration::from_millis(2));
+    }
+    let t = Instant::now();
+    f.server.shutdown();
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(f.server.active_connections(), 0);
+    let held = h.join().unwrap();
+    assert!(held < Duration::from_secs(5), "{held:?}");
+}
+
+#[test]
+fn peer_close_gets_a_flushed_close_reply() {
+    let f = fixture(MockBackend::new());
+    let mut ws = f.connect();
+    open(&mut ws);
+    ws.close(Some(CloseFrame {
+        code: CloseCode::Normal,
+        reason: "".into(),
+    }))
+    .unwrap();
+    // A completed closing handshake ends in ConnectionClosed; a server that
+    // dropped the socket without replying yields a protocol error instead.
+    loop {
+        match ws.read() {
+            Ok(_) => {}
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => break,
+            Err(e) => panic!("no close reply: {e:?}"),
+        }
+    }
+    f.assert_retired();
+}
