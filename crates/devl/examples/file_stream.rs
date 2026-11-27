@@ -1,17 +1,28 @@
 //! Replay one WAV through a streaming Whisper session.
 mod support;
+#[path = "support/tokenizer.rs"]
+mod tokenizer;
 
 use std::time::Instant;
 
 use devl::DevlSession;
 use serde_json::json;
 use support::{
-    CHUNK_SAMPLES, Inputs, Result, SESSION_CONFIG, commit_record, emit, is_checkpoint, load_wav,
+    ArgsSpec, CHUNK_SAMPLES, Inputs, Result, SESSION_CONFIG, commit_record, emit, is_checkpoint,
+    load_wav,
 };
 
 fn main() -> Result<()> {
-    let inputs = Inputs::parse("file_stream", 1, 1)?;
-    let tokenizer = inputs.load_tokenizer()?;
+    let inputs = Inputs::parse(
+        "file_stream",
+        ArgsSpec {
+            min_files: 1,
+            max_files: 1,
+            allow_tokenizer: true,
+            allow_references: false,
+        },
+    )?;
+    let tokenizer = tokenizer::load(inputs.tokenizer.as_deref())?;
     let pcm = load_wav(&inputs.fixtures[0])?;
     let (backend, model) = inputs.load_backend()?;
     let mut session = DevlSession::new(&backend, SESSION_CONFIG)?;
