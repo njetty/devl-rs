@@ -3,7 +3,7 @@
 //! `devl` re-exports [`devl_core`] at the crate root (and under [`core`]) and
 //! exposes optional inference backends behind Cargo feature flags:
 //!
-//! - `candle`: enables [`candle`] (`devl-candle`) for local CPU inference.
+//! - `candle`: enables `devl::candle` (`devl-candle`) for local CPU inference.
 //! - `metal`: enables `candle` with Metal acceleration.
 //! - `cuda`: enables `candle` with CUDA acceleration.
 //! - `test-utils`: enables `devl_core::mock` (`MockBackend`) for deterministic testing.
