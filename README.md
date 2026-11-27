@@ -237,16 +237,11 @@ Speedup is **4.42x** on median TTFS (`1479.0 / 334.9`) and **3.14x** on p99
 | Offline WER | 0.0506 (17 errors / 336 reference words) |
 | DEVL WER | 0.0506 (17 errors / 336 reference words) |
 
-Caveats: the DEVL run performs more total work than offline greedy — it
-verifies 404 draft tokens of which 311 are accepted (77.0%), so the remaining
-~23% of draft tokens are discarded; the measured speedup is achieved while
-that extra draft work runs concurrently. The p99 is the maximum of a 12-sample
-set, reported for completeness, not a tail statistic.
-
-Offline and DEVL WER are identical by construction: the exact token-match rate
-is 1.0, so both decoders produce the same token stream, and both are scored
-through the same tokenizer and normalization. The value is a WER on the
-reference transcripts, not a claim that the model is good at this task.
+The benchmark runs drafts synchronously during audio replay and records their
+cost separately. TTFS measures only the wait after the final chunk is
+available. With 12 clips, the nearest-rank p99 is the slowest observation.
+Both paths produce identical tokens on this sample, so their WER is also
+identical.
 
 `openai/whisper-large-v3-turbo` was not run: no compatible weights were
 prepared in the fixture directory at measurement time.
