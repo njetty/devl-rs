@@ -470,6 +470,24 @@ fn rejects_bad_inputs_without_corrupting_the_cache() {
 }
 
 #[test]
+fn failed_greedy_selection_preserves_cache() {
+    let cfg = tiny_config();
+    let mut tensors = weights(&cfg, 42, true);
+    let shape = (cfg.vocab_size, cfg.hidden_size);
+    let invalid_head =
+        Tensor::from_vec(vec![f32::NAN; shape.0 * shape.1], shape, &Device::Cpu).unwrap();
+    tensors.insert("thinker.lm_head.weight".into(), invalid_head);
+    let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu).pp("thinker");
+    let decoder = Qwen3AsrDecoder::load(cfg, vb).unwrap();
+    let mut cache = decoder.new_cache();
+    let prefix = decoder.embed_tokens(&[1, 2]).unwrap();
+    decoder.extend(&prefix, &mut cache).unwrap();
+
+    assert!(decoder.step(3, &mut cache).is_err());
+    assert_eq!(cache.len(), 2);
+}
+
+#[test]
 fn greedy_argmax_ties_and_nan() {
     let t = Tensor::from_vec(vec![1.0_f32, 3.0, 3.0, 0.0, 5.0, 5.0], (2, 3), &Device::Cpu).unwrap();
     assert_eq!(argmax_rows(&t).unwrap(), vec![1, 1]);

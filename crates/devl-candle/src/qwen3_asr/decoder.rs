@@ -417,12 +417,15 @@ impl Qwen3AsrDecoder {
             x = (x + mlp)?;
             updated.push(kv);
         }
+        let logits = if tail == 0 {
+            None
+        } else {
+            let last = x.narrow(0, len - tail, tail)?;
+            let hidden = self.norm.forward(&last)?;
+            Some(self.lm_head.forward(&hidden)?.to_dtype(DType::F32)?)
+        };
         cache.commit(updated, len);
-        if tail == 0 {
-            return Ok(None);
-        }
-        let last = x.narrow(0, len - tail, tail)?;
-        Ok(Some(self.norm.forward(&last)?))
+        Ok(logits)
     }
 
     /// Append `embeds` to the cache without computing logits.
@@ -453,10 +456,8 @@ impl Qwen3AsrDecoder {
                 "logit_rows must be at least 1 (use extend to skip the head)".into(),
             ));
         }
-        let hidden = self
-            .forward(embeds, cache, logit_rows)?
-            .expect("tail > 0 yields hidden states");
-        Ok(self.lm_head.forward(&hidden)?.to_dtype(DType::F32)?)
+        self.forward(embeds, cache, logit_rows)?
+            .ok_or_else(|| Qwen3AsrError::InvalidInput("prefill produced no logit rows".into()))
     }
 
     /// Feed one token at absolute position `cache.len()` and return its `f32` logits `[vocab_size]`.
@@ -471,7 +472,11 @@ impl Qwen3AsrDecoder {
 
     /// Feed one token and return the greedy next token. No suppression is applied.
     pub fn step(&self, token: u32, cache: &mut Qwen3AsrKvCache) -> Result<u32, Qwen3AsrError> {
-        argmax_rows(&self.step_logits(token, cache)?.unsqueeze(0)?).map(|v| v[0])
+        let mut next = cache.fork();
+        let logits = self.step_logits(token, &mut next)?;
+        let token = argmax_rows(&logits.unsqueeze(0)?)?[0];
+        *cache = next;
+        Ok(token)
     }
 }
 
