@@ -1,12 +1,14 @@
 //! Candle inference backend for `devl-rs`.
 //!
-//! Provides deterministic Whisper log-mel feature extraction ([`mel`]) and the
-//! [`CandleWhisperBackend`] implementation of [`DevlBackend`]. Whisper encoder
-//! and KV-truncatable decoder forward passes are tracked in Phase 2.
+//! Provides deterministic Whisper log-mel feature extraction ([`mel`]),
+//! stateless Whisper encoder/decoder layers with external KV-cache rollback
+//! ([`whisper`]), and the [`CandleWhisperBackend`] implementation of
+//! [`DevlBackend`].
 
 pub mod mel;
+pub mod whisper;
 
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::whisper::Config as WhisperModelConfig;
 use devl_core::{DevlBackend, StepOutput, TokenId, VerifyOutput};
@@ -16,6 +18,7 @@ pub use mel::{
     MelFilterBank, WHISPER_MAX_SAMPLES, WHISPER_MEL_BINS_V1_V2, WHISPER_MEL_BINS_V3,
     WHISPER_N_FFT_BINS, WHISPER_N_FRAMES, WHISPER_SAMPLE_RATE_HZ, pcm_to_mel_tensor,
 };
+pub use whisper::{AudioEncoder, TextDecoder, WhisperModel};
 
 /// Configuration for [`CandleWhisperBackend`].
 #[derive(Debug, Clone)]
@@ -116,6 +119,21 @@ pub enum CandleBackendError {
         filter_mel_bins: usize,
     },
 
+    /// Invalid backend or model configuration.
+    #[error("invalid Whisper backend configuration: {0}")]
+    InvalidConfig(&'static str),
+
+    /// Decoder sequence length exceeds `max_target_positions`.
+    #[error(
+        "decoder sequence length {seq_len} exceeds max_target_positions ({max_target_positions})"
+    )]
+    ContextLengthExceeded {
+        /// Requested decoder sequence length.
+        seq_len: usize,
+        /// Maximum target positions supported by the Whisper decoder.
+        max_target_positions: usize,
+    },
+
     /// Invalid KV-cache rollback length.
     #[error("invalid KV rollback length {requested} (prompt_len={prompt_len}, seq_len={seq_len})")]
     InvalidRollback {
@@ -144,36 +162,192 @@ pub struct WhisperAudioEncoding {
 pub struct WhisperKvCache {
     /// Number of decoder prompt tokens `P` preceding generated tokens.
     pub prompt_len: usize,
-    /// Per-layer self-attention `(k, v)` tensors.
+    /// Per-layer self-attention `(k, v)` tensors of shape `[1, n_head, seq_len, head_dim]`.
     pub self_attn_kv: Vec<Option<(Tensor, Tensor)>>,
-    /// Per-layer cross-attention `(k, v)` tensors.
+    /// Per-layer cross-attention `(k, v)` tensors of shape `[1, n_head, T_enc, head_dim]`.
     pub cross_attn_kv: Vec<Option<(Tensor, Tensor)>>,
 }
 
-/// Local Whisper inference backend over Candle (Phase 2 implementation pending).
+impl WhisperKvCache {
+    /// Current total cached sequence length (`prompt_len + generated_tokens`),
+    /// or `0` if self-attention KV has not yet been populated.
+    pub fn seq_len(&self) -> usize {
+        self.self_attn_kv
+            .first()
+            .and_then(|entry| entry.as_ref())
+            .and_then(|(k, _)| k.dim(2).ok())
+            .unwrap_or(0)
+    }
+}
+
+/// Local Whisper inference backend over Candle implementing [`DevlBackend`].
+///
+/// `CandleWhisperBackend` is stateless (`&self`, `Send + Sync`) and stores
+/// per-pass KV state externally in [`WhisperKvCache`], allowing an
+/// `Arc<CandleWhisperBackend>` to be shared across worker threads.
 #[derive(Debug, Clone)]
 pub struct CandleWhisperBackend {
     config: CandleWhisperConfig,
+    model_config: WhisperModelConfig,
+    mel_filters: MelFilterBank,
+    model: WhisperModel,
 }
 
 impl CandleWhisperBackend {
-    /// Construct a stub `CandleWhisperBackend` with the given configuration.
-    pub fn new(config: CandleWhisperConfig) -> Self {
-        Self { config }
-    }
-
-    /// Construct a `CandleWhisperBackend` from loaded Candle weights (Phase 2).
+    /// Load a [`CandleWhisperBackend`] from standard Hugging Face Whisper weights
+    /// (`model.encoder.*` and `model.decoder.*`) via `vb`.
+    ///
+    /// If `config.mel_filters` is `None`, a deterministic Slaney mel filter bank
+    /// matching `model_config.num_mel_bins` (`80` or `128`) is constructed.
     pub fn from_var_builder(
-        _vb: VarBuilder<'_>,
-        _config: CandleWhisperConfig,
+        vb: VarBuilder<'_>,
+        config: CandleWhisperConfig,
     ) -> Result<Self, CandleBackendError> {
-        todo!("Phase 2: load Whisper encoder and KV-truncatable decoder weights from VarBuilder")
+        if !config.device.same_device(vb.device()) {
+            return Err(CandleBackendError::InvalidConfig(
+                "config.device must match VarBuilder device",
+            ));
+        }
+
+        let model_config = config
+            .model_config
+            .clone()
+            .ok_or(CandleBackendError::InvalidConfig(
+                "model_config must be provided",
+            ))?;
+
+        validate_whisper_config(&config, &model_config)?;
+
+        let mel_filters = match &config.mel_filters {
+            Some(filters) => {
+                if filters.num_mel_bins() != model_config.num_mel_bins {
+                    return Err(CandleBackendError::MelBinMismatch {
+                        model_mel_bins: model_config.num_mel_bins,
+                        filter_mel_bins: filters.num_mel_bins(),
+                    });
+                }
+                filters.clone()
+            }
+            None => MelFilterBank::slaney(model_config.num_mel_bins)?,
+        };
+
+        let model = WhisperModel::load(vb, &model_config)?;
+
+        Ok(Self {
+            config,
+            model_config,
+            mel_filters,
+            model,
+        })
     }
 
     /// Access the backend configuration.
     pub fn config(&self) -> &CandleWhisperConfig {
         &self.config
     }
+
+    /// Access the validated Whisper architecture configuration.
+    pub fn model_config(&self) -> &WhisperModelConfig {
+        &self.model_config
+    }
+
+    /// Access the validated Whisper mel filter bank.
+    pub fn mel_filters(&self) -> &MelFilterBank {
+        &self.mel_filters
+    }
+
+    /// Access the underlying stateless Whisper encoder/decoder model.
+    pub fn model(&self) -> &WhisperModel {
+        &self.model
+    }
+
+    /// Run reference offline greedy decoding without KV caching by recomputing
+    /// the full causal prefix at each step.
+    ///
+    /// Intended for offline baselines and exactness verification against
+    /// [`devl_core::DevlSession`].
+    pub fn offline_greedy_decode(
+        &self,
+        pcm: &[f32],
+        max_tokens: usize,
+    ) -> Result<Vec<TokenId>, CandleBackendError> {
+        if max_tokens == 0 {
+            return Err(CandleBackendError::InvalidConfig(
+                "max_tokens must be at least 1",
+            ));
+        }
+        let encoding = self.encode_audio(pcm, None)?;
+        let mut context = self.config.prompt_tokens.clone();
+        let mut generated = Vec::new();
+
+        while generated.len() < max_tokens {
+            let hidden = self
+                .model
+                .decoder
+                .forward_full_no_cache(&context, &encoding.encoder_hidden_states)?;
+            let last_hidden = hidden.narrow(1, context.len() - 1, 1)?;
+            let logits = self
+                .model
+                .decoder
+                .project_logits(&last_hidden)?
+                .squeeze(0)?
+                .squeeze(0)?;
+            let next_token = TextDecoder::argmax_last_dim(&logits)?.to_scalar::<u32>()?;
+            generated.push(next_token);
+            if next_token == self.config.eos_token {
+                break;
+            }
+            context.push(next_token);
+        }
+
+        Ok(generated)
+    }
+}
+
+fn validate_whisper_config(
+    config: &CandleWhisperConfig,
+    model_config: &WhisperModelConfig,
+) -> Result<(), CandleBackendError> {
+    if config.prompt_tokens.is_empty() {
+        return Err(CandleBackendError::InvalidConfig(
+            "prompt_tokens must contain at least one token",
+        ));
+    }
+    if config.prompt_tokens.len() > model_config.max_target_positions {
+        return Err(CandleBackendError::ContextLengthExceeded {
+            seq_len: config.prompt_tokens.len(),
+            max_target_positions: model_config.max_target_positions,
+        });
+    }
+    if model_config.d_model < 4 || !model_config.d_model.is_multiple_of(2) {
+        return Err(CandleBackendError::InvalidConfig(
+            "d_model must be even and at least 4",
+        ));
+    }
+    if model_config.encoder_layers == 0 || model_config.decoder_layers == 0 {
+        return Err(CandleBackendError::InvalidConfig(
+            "encoder_layers and decoder_layers must be non-zero",
+        ));
+    }
+    if model_config.encoder_attention_heads == 0
+        || model_config.decoder_attention_heads == 0
+        || !model_config
+            .d_model
+            .is_multiple_of(model_config.encoder_attention_heads)
+        || !model_config
+            .d_model
+            .is_multiple_of(model_config.decoder_attention_heads)
+    {
+        return Err(CandleBackendError::InvalidConfig(
+            "d_model must be divisible by encoder and decoder attention heads",
+        ));
+    }
+    if model_config.vocab_size == 0 {
+        return Err(CandleBackendError::InvalidConfig(
+            "vocab_size must be non-zero",
+        ));
+    }
+    Ok(())
 }
 
 impl DevlBackend for CandleWhisperBackend {
@@ -190,44 +364,102 @@ impl DevlBackend for CandleWhisperBackend {
     }
 
     fn new_kv_cache(&self) -> Result<Self::KvCache, Self::Error> {
+        let n_layers = self.model.decoder.num_layers();
         Ok(WhisperKvCache {
             prompt_len: self.config.prompt_tokens.len(),
-            self_attn_kv: Vec::new(),
-            cross_attn_kv: Vec::new(),
+            self_attn_kv: vec![None; n_layers],
+            cross_attn_kv: vec![None; n_layers],
         })
     }
 
     fn encode_audio(
         &self,
-        _pcm: &[f32],
+        pcm: &[f32],
         _prior_encoding: Option<&Self::AudioEncoding>,
     ) -> Result<Self::AudioEncoding, Self::Error> {
-        todo!("Phase 2: compute deterministic log-mel spectrogram and run Whisper AudioEncoder")
+        let mel = pcm_to_mel_tensor(
+            &self.model_config,
+            &self.mel_filters,
+            pcm,
+            &self.config.device,
+        )?;
+        let encoder_hidden_states = self.model.encoder.forward(&mel)?;
+        Ok(WhisperAudioEncoding {
+            encoder_hidden_states,
+        })
     }
 
     fn verify_draft(
         &self,
-        _encoding: &Self::AudioEncoding,
-        _kv: &mut Self::KvCache,
-        _draft: &[TokenId],
+        encoding: &Self::AudioEncoding,
+        kv: &mut Self::KvCache,
+        draft: &[TokenId],
     ) -> Result<VerifyOutput, Self::Error> {
-        todo!("Phase 2: single-pass causal prefill of prompt ++ draft[..k-1] and on-device argmax")
+        let prompt_len = self.config.prompt_tokens.len();
+        kv.prompt_len = prompt_len;
+
+        let prefix_draft_len = draft.len().saturating_sub(1);
+        let mut input_tokens = Vec::with_capacity(prompt_len + prefix_draft_len);
+        input_tokens.extend_from_slice(&self.config.prompt_tokens);
+        input_tokens.extend_from_slice(&draft[..prefix_draft_len]);
+
+        let hidden = self.model.decoder.forward_prefill(
+            &input_tokens,
+            &encoding.encoder_hidden_states,
+            kv,
+        )?;
+
+        let num_verified = draft.len().max(1);
+        let verified_hidden = hidden.narrow(1, prompt_len - 1, num_verified)?;
+        let logits = self
+            .model
+            .decoder
+            .project_logits(&verified_hidden)?
+            .squeeze(0)?;
+
+        let argmax_tokens = TextDecoder::argmax_last_dim(&logits)?.to_vec1::<u32>()?;
+        let host_logits = if self.config.return_logits {
+            Some(logits.to_dtype(DType::F32)?.to_vec2::<f32>()?)
+        } else {
+            None
+        };
+
+        Ok(VerifyOutput {
+            argmax_tokens,
+            logits: host_logits,
+        })
     }
 
-    fn rollback_kv(
-        &self,
-        _kv: &mut Self::KvCache,
-        _accepted_len: usize,
-    ) -> Result<(), Self::Error> {
-        todo!("Phase 2: narrow per-layer self-attention KV caches to kv.prompt_len + accepted_len")
+    fn rollback_kv(&self, kv: &mut Self::KvCache, accepted_len: usize) -> Result<(), Self::Error> {
+        self.model.decoder.rollback_kv(kv, accepted_len)
     }
 
     fn decode_step(
         &self,
-        _encoding: &Self::AudioEncoding,
-        _kv: &mut Self::KvCache,
-        _input_token: TokenId,
+        encoding: &Self::AudioEncoding,
+        kv: &mut Self::KvCache,
+        input_token: TokenId,
     ) -> Result<StepOutput, Self::Error> {
-        todo!("Phase 2: run single-token Whisper decoder forward step and append KV state")
+        let hidden =
+            self.model
+                .decoder
+                .forward_step(input_token, &encoding.encoder_hidden_states, kv)?;
+        let logits = self
+            .model
+            .decoder
+            .project_logits(&hidden)?
+            .squeeze(0)?
+            .squeeze(0)?;
+        let token = TextDecoder::argmax_last_dim(&logits)?.to_scalar::<u32>()?;
+        let host_logits = if self.config.return_logits {
+            Some(logits.to_dtype(DType::F32)?.to_vec1::<f32>()?)
+        } else {
+            None
+        };
+
+        Ok(StepOutput {
+            token,
+            logits: host_logits,
+        })
     }
 }

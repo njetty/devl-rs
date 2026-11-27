@@ -21,6 +21,9 @@ candle-nn.workspace = true
 candle-transformers.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+devl-core = { workspace = true, features = ["test-utils"] }
+
 [lints]
 workspace = true
 
