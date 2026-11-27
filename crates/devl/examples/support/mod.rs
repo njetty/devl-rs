@@ -1,3 +1,8 @@
+// Shared helpers are compiled once per example; individual examples use
+// different subsets of these items.
+#![allow(dead_code)]
+
+use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -28,6 +33,8 @@ pub(super) struct Inputs {
     pub(super) device: String,
     pub(super) model_dir: PathBuf,
     pub(super) fixtures: Vec<PathBuf>,
+    pub(super) tokenizer: Option<PathBuf>,
+    pub(super) references: Option<PathBuf>,
 }
 
 impl Inputs {
@@ -39,21 +46,57 @@ impl Inputs {
             })
             .collect::<std::result::Result<_, _>>()?;
         let usage = format!(
-            "usage: {example} <cpu|metal> <model-dir> <audio.wav>{}",
-            if max_files == 1 { "" } else { " <more.wav>..." }
+            "usage: {example} <cpu|metal> <model-dir> {} [--tokenizer <path>] [--references <path>]",
+            if max_files == 1 {
+                "<audio.wav>"
+            } else {
+                "<audio.wav>..."
+            }
         );
-        let [_, device, model_dir, files @ ..] = argv.as_slice() else {
+        let [_, device, model_dir, rest @ ..] = argv.as_slice() else {
             return Err(usage.into());
         };
-        if !(min_files..=max_files).contains(&files.len())
-            || !matches!(device.as_str(), "cpu" | "metal")
-        {
+        if !matches!(device.as_str(), "cpu" | "metal") {
             return Err(usage.into());
+        }
+        let mut fixtures = Vec::new();
+        let mut tokenizer = None;
+        let mut references = None;
+        let mut index = 0;
+        while index < rest.len() {
+            let arg = rest[index].as_str();
+            match arg {
+                "--tokenizer" => {
+                    index += 1;
+                    let Some(path) = rest.get(index) else {
+                        return Err(usage.into());
+                    };
+                    tokenizer = Some(PathBuf::from(path));
+                }
+                "--references" => {
+                    index += 1;
+                    let Some(path) = rest.get(index) else {
+                        return Err(usage.into());
+                    };
+                    references = Some(PathBuf::from(path));
+                }
+                _ if arg.starts_with("--") => return Err(usage.into()),
+                _ => fixtures.push(PathBuf::from(arg)),
+            }
+            index += 1;
+        }
+        if !(min_files..=max_files).contains(&fixtures.len()) {
+            return Err(usage.into());
+        }
+        if references.is_some() && tokenizer.is_none() {
+            return Err("--references requires --tokenizer for transcript normalization".into());
         }
         Ok(Self {
             device: device.clone(),
             model_dir: model_dir.into(),
-            fixtures: files.iter().map(PathBuf::from).collect(),
+            fixtures,
+            tokenizer,
+            references,
         })
     }
 
@@ -91,6 +134,20 @@ impl Inputs {
             },
         )?;
         Ok((backend, model_id))
+    }
+
+    pub(super) fn load_tokenizer(&self) -> Result<Option<Tokenizer>> {
+        match &self.tokenizer {
+            Some(path) => Ok(Some(Tokenizer::load(path)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub(super) fn load_references(&self) -> Result<Option<HashMap<String, String>>> {
+        match &self.references {
+            Some(path) => load_references(path).map(Some),
+            None => Ok(None),
+        }
     }
 }
 
@@ -151,4 +208,118 @@ pub(super) fn emit(value: &Value) -> Result<()> {
     serde_json::to_writer(&mut out, value)?;
     writeln!(out)?;
     Ok(())
+}
+
+/// A Whisper tokenizer loaded from a `tokenizer.json` file.
+pub(super) struct Tokenizer {
+    inner: tokenizers::Tokenizer,
+}
+
+impl Tokenizer {
+    pub(super) fn load(path: &Path) -> Result<Self> {
+        let inner = tokenizers::Tokenizer::from_file(path)
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        Ok(Self { inner })
+    }
+
+    /// Decode token ids into human-readable text, dropping special tokens.
+    pub(super) fn decode(&self, tokens: &[u32]) -> Result<String> {
+        let text = self
+            .inner
+            .decode(tokens, true)
+            .map_err(|err| format!("tokenizer decode failed: {err}"))?;
+        Ok(text.trim().to_owned())
+    }
+}
+
+/// Load a reference transcript map from JSON: WAV file basename to transcript.
+pub(super) fn load_references(path: &Path) -> Result<HashMap<String, String>> {
+    let raw = fs::read_to_string(path)?;
+    let references: HashMap<String, String> = serde_json::from_str(&raw).map_err(|err| {
+        format!(
+            "{}: expected a JSON object mapping WAV basenames to transcripts: {err}",
+            path.display()
+        )
+    })?;
+    Ok(references)
+}
+
+/// Reference lookup keyed on the fixture's file name.
+pub(super) fn reference_for<'a>(
+    references: &'a HashMap<String, String>,
+    fixture: &Path,
+) -> Result<&'a str> {
+    let key = fixture
+        .file_name()
+        .ok_or_else(|| format!("{}: path has no file name", fixture.display()))?
+        .to_str()
+        .ok_or_else(|| format!("{}: file name is not valid UTF-8", fixture.display()))?;
+    references.get(key).map(String::as_str).ok_or_else(|| {
+        format!(
+            "{}: no reference transcript for WAV basename '{key}'",
+            fixture.display()
+        )
+        .into()
+    })
+}
+
+/// Normalize text to lowercase word tokens: split on any non-alphanumeric
+/// character and drop empty fragments. Punctuation and case differences are
+/// therefore ignored by WER.
+pub(super) fn normalize_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for ch in text.to_lowercase().chars() {
+        if ch.is_alphanumeric() {
+            current.push(ch);
+        } else if !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+/// Aggregate reference word counts and word-level errors across samples.
+pub(super) struct WerAggregate {
+    pub(super) reference_words: usize,
+    pub(super) errors: usize,
+}
+
+impl WerAggregate {
+    pub(super) fn new() -> Self {
+        Self {
+            reference_words: 0,
+            errors: 0,
+        }
+    }
+
+    pub(super) fn add(&mut self, reference: &[String], hypothesis: &[String]) -> Option<f64> {
+        if reference.is_empty() {
+            return None;
+        }
+        let n = reference.len();
+        let m = hypothesis.len();
+        let mut previous: Vec<usize> = (0..=m).collect();
+        let mut current = vec![0usize; m + 1];
+        for (i, reference_word) in reference.iter().enumerate() {
+            current[0] = i + 1;
+            for (j, hypothesis_word) in hypothesis.iter().enumerate() {
+                let cost = usize::from(reference_word != hypothesis_word);
+                current[j + 1] = (previous[j + 1] + 1)
+                    .min(current[j] + 1)
+                    .min(previous[j] + cost);
+            }
+            std::mem::swap(&mut previous, &mut current);
+        }
+        self.reference_words += n;
+        self.errors += previous[m];
+        Some(previous[m] as f64 / n as f64)
+    }
+
+    pub(super) fn wer(&self) -> Option<f64> {
+        (self.reference_words != 0).then(|| self.errors as f64 / self.reference_words as f64)
+    }
 }

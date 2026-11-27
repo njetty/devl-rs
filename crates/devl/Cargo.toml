@@ -34,6 +34,7 @@ candle-transformers.workspace = true
 hound = "3.5"
 serde_json = "1"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+tokenizers = "0.23"
 
 [[example]]
 name = "file_stream"
