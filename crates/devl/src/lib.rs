@@ -17,6 +17,11 @@
 //! }
 //! ```
 
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/njetty/devl-rs/main/assets/icon-ink.svg",
+    html_favicon_url = "https://raw.githubusercontent.com/njetty/devl-rs/main/assets/icon-ink.svg"
+)]
+
 pub use devl_core as core;
 pub use devl_core::*;
 

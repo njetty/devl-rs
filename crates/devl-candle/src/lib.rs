@@ -5,6 +5,11 @@
 //! ([`whisper`]), and the [`CandleWhisperBackend`] implementation of
 //! [`DevlBackend`].
 
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/njetty/devl-rs/main/assets/icon-ink.svg",
+    html_favicon_url = "https://raw.githubusercontent.com/njetty/devl-rs/main/assets/icon-ink.svg"
+)]
+
 pub mod mel;
 pub mod whisper;
 

@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/njetty/devl-rs/main/assets/icon-ink.svg">
+  <img src="https://raw.githubusercontent.com/njetty/devl-rs/main/assets/icon-paper.svg" width="48" height="48" alt="">
+</picture>
+
 # devl-rs
 
 An independent, unofficial Rust implementation of **DEVL: Decode Early, Verify Late** by Doyeob Kim ([arXiv:2611.20064](https://arxiv.org/abs/2611.20064)). This project has no affiliation with, and is not endorsed by, the paper author or Nari Labs.
