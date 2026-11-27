@@ -50,8 +50,11 @@ pub enum CandleBackendError {
     /// Invalid KV-cache rollback length.
     #[error("invalid KV rollback length {requested} (prompt_len={prompt_len}, seq_len={seq_len})")]
     InvalidRollback {
+        /// Requested generated-token length to retain.
         requested: usize,
+        /// Decoder prompt length `P` tracked in the KV cache.
         prompt_len: usize,
+        /// Total sequence length currently stored in the KV cache.
         seq_len: usize,
     },
 }

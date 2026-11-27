@@ -30,13 +30,20 @@ pub enum DevlError<E> {
     /// Operation is not permitted in the current [`SessionState`].
     #[error("cannot perform `{action}` while session is in state `{state:?}`")]
     InvalidState {
+        /// Name of the rejected operation.
         action: &'static str,
+        /// Current session state when the operation was attempted.
         state: SessionState,
     },
 
     /// Backend violated the [`DevlBackend::verify_draft`] output length contract.
     #[error("verify_draft returned {actual} argmax tokens, expected {expected}")]
-    InvalidVerifyOutput { expected: usize, actual: usize },
+    InvalidVerifyOutput {
+        /// Expected number of argmax predictions (`draft.len().max(1)`).
+        expected: usize,
+        /// Actual number of argmax predictions returned by the backend.
+        actual: usize,
+    },
 
     /// Underlying inference backend error.
     #[error("backend error: {0}")]

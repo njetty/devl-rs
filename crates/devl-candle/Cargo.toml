@@ -23,3 +23,7 @@ thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.docs.rs]
+no-default-features = true
+rustdoc-args = ["--cfg", "docsrs"]

@@ -333,23 +333,25 @@ Per Section 2 (item 4) and Section 3 of arXiv:2611.20064v1, TTFS is minimized un
 ### Whisper (`CandleWhisperBackend`)
 
 - **Encoder behavior (whole-clip)**:
-  - Per Table 1 of arXiv:2611.20064v1, Whisper's encoder attends over the full utterance window. `encode_audio(pcm, _prior_encoding)` ignores `prior_encoding`, deterministically computes the log-mel spectrogram (80 bins for v1/v2, 128 bins for v3/v3-turbo), and runs the Whisper `AudioEncoder` to produce `AudioEncoding { encoder_hidden_states: Tensor }`.
-- **Decoder & KV-cache truncation**:
-  - Stock `candle_transformers::models::whisper::model::TextDecoder` only provides `reset_kv_cache()` (full clear), not partial truncation.
-  - `devl-candle` will wrap/adapt the Whisper decoder attention layers so `WhisperKvCache` holds:
+  - Per Table 1 of arXiv:2611.20064v1, Whisper's encoder attends over the full utterance window. `encode_audio(pcm, _prior_encoding)` ignores `prior_encoding`, deterministically computes the log-mel spectrogram via `candle_transformers::models::whisper::audio::pcm_to_mel` (80 bins for v1/v2, 128 bins for v3/v3-turbo; padded to `N_FRAMES = 3000` / 30 s), and runs the Whisper audio encoder to produce `WhisperAudioEncoding { encoder_hidden_states: Tensor }`.
+- **Decoder & KV-cache truncation (verified against `candle-transformers 0.11.1`)**:
+  - In `candle-transformers 0.11.1`, stock `models::whisper::model::TextDecoder` only caches cross-attention KV (`xa.is_some()`), recomputes self-attention over the entire prefix on every step, and requires `&mut self` (storing mutable cache state directly inside attention blocks).
+  - Consequently, `devl-candle` will implement a stateless (`&self`, `Send + Sync`) Whisper `AudioEncoder` and `TextDecoder` loaded from the standard Hugging Face `VarBuilder` paths (`model.encoder.*` and `model.decoder.*`), taking an explicit `&mut WhisperKvCache` per call so `Arc<CandleWhisperBackend>` can be shared across `PriorityScheduler` worker threads without locking model weights.
+  - `WhisperKvCache` holds:
     - `prompt_len: usize` (the SOT/language/task/no-timestamps prefix length).
     - Per-layer self-attention `(k, v)` tensors (`[1, n_head, seq_len, head_dim]`) and cross-attention `(k, v)` tensors computed once from `encoder_hidden_states`.
   - **`verify_draft`**:
-    - Resets self-attention KV, computes cross-attention KV from `encoding`, concatenates `[prompt_tokens, draft[..k.saturating_sub(1)]]`, and runs one parallel causal decoder forward pass.
-    - Computes per-position argmax on device (`logits.argmax(D::Minus1)`) over `[prompt_len - 1 .. prompt_len - 1 + k.max(1)]` so only `k.max(1)` `u32` IDs transfer to the host (copying full logits only when diagnostics are enabled).
+    - Resets self-attention KV, computes cross-attention KV from `encoding`, concatenates `[prompt_tokens, draft[..k.saturating_sub(1)]]`, slices positional embeddings at `0..L`, applies the causal mask `mask[0..L, 0..L]`, and runs one parallel decoder forward pass.
+    - Applies configured `Config::suppress_tokens` (if any) and computes per-position argmax on device (`logits.argmax(D::Minus1)`) over `[prompt_len - 1 .. prompt_len - 1 + k.max(1)]` so only `k.max(1)` `u32` IDs transfer to the host (copying full logits only when `return_logits` is enabled).
   - **`rollback_kv(kv, accepted_len)`**:
-    - Truncates each decoder layer's self-attention `(k, v)` tensors to `target_len = kv.prompt_len + accepted_len` using `Tensor::narrow(seq_dim, 0, target_len)` (or an $O(1)$ write-cursor reset if using preallocated overwrite buffers, matching Table 1's "overwrite KV" strategy).
+    - Truncates each decoder layer's self-attention `(k, v)` tensors to `target_len = kv.prompt_len + accepted_len` using `Tensor::narrow(seq_dim, 0, target_len)` (or an $O(1)$ write-cursor reset with preallocated overwrite buffers, matching Table 1's "overwrite KV" strategy).
     - Preserves cross-attention KV intact since it depends solely on `encoder_hidden_states`.
   - **`decode_step`**:
-    - Feeds a single `[1, 1]` token tensor at position `seq_len`, appends its `(k, v)` slice to each layer's self-attention cache, and returns the next argmax token.
+    - Feeds a single `[1, 1]` token tensor with positional embedding sliced at offset `pos = seq_len` (`positional_embedding.narrow(0, pos, 1)`), appends its `(k, v)` slice to each layer's self-attention cache, attends over `0..=pos` with no causal mask needed, and returns the next greedy argmax token.
 
-### Qwen3-ASR (Planned Extension)
+### Qwen3-ASR (Planned Phase 3 Extension)
 
+- **Upstream status**: `candle-transformers 0.11.1` includes `qwen3` / `qwen3_vl` text/vision models but does not yet provide a `qwen3_asr` module; Phase 3 will implement the windowed audio encoder and Qwen3 decoder KV-cache wrapper directly over `candle-core` and `candle-nn`.
 - **Encoder behavior (fixed windows)**:
   - Per Table 1 of arXiv:2611.20064v1, Qwen3-ASR encodes fixed non-overlapping audio windows from stream start and prefills completed blocks into the LLM decoder KV cache once during speech.
   - `encode_audio(pcm, prior_encoding)` reuses cached audio blocks and their prefilled prefix KV state from `prior_encoding` when normalization is unchanged, encoding only newly completed blocks and recording the tail; if normalization changed, cached blocks are invalidated and rebuilt from the prompt prefix.

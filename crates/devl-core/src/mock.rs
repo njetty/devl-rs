@@ -17,13 +17,21 @@ pub const MOCK_EOS_TOKEN: TokenId = 0;
 pub enum MockError {
     /// Injected error for testing failure paths.
     #[error("injected mock failure during `{stage}`")]
-    Injected { stage: &'static str },
+    Injected {
+        /// Backend method name where the failure was injected.
+        stage: &'static str,
+    },
 
     /// Attempted to roll back KV cache past its populated generated length.
     #[error(
         "rollback_kv requested accepted_len={requested}, but kv only has {available} generated tokens"
     )]
-    InvalidRollback { requested: usize, available: usize },
+    InvalidRollback {
+        /// Requested generated-token prefix length to retain.
+        requested: usize,
+        /// Number of generated tokens currently populated in the KV cache.
+        available: usize,
+    },
 }
 
 /// Encoded audio handle produced by [`MockBackend`].
@@ -54,10 +62,15 @@ pub struct MockKvCache {
 /// Execution telemetry recorded by [`MockBackend`].
 #[derive(Debug, Default)]
 pub struct MockMetrics {
+    /// Total `encode_audio` invocations.
     pub encode_calls: AtomicUsize,
+    /// Total `verify_draft` invocations.
     pub verify_calls: AtomicUsize,
+    /// Total `rollback_kv` invocations.
     pub rollback_calls: AtomicUsize,
+    /// Total `decode_step` invocations.
     pub decode_step_calls: AtomicUsize,
+    /// Number of `encode_audio` calls that received a reusable `prior_encoding`.
     pub prior_encoding_reuses: AtomicUsize,
 }
 
