@@ -951,4 +951,3 @@ Cache paths exercised by the streaming runs (drafts every 2 s of buffered audio,
 - The streaming path here is the offline-exact DEVL protocol. The upstream vLLM streaming heuristic (6.12) is not compared.
 - The drafts are taken at a fixed 2 s cadence and are not a model of server endpointing, which belongs to `devl-server`.
 - The reference records the token ids from `generate`, not the post-processed text of `parse_asr_output`.
-

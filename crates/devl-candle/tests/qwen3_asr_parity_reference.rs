@@ -86,7 +86,7 @@ struct Reference {
     prompt_len: usize,
 }
 
-fn read_reference(path: &Path) -> Reference {
+fn read_reference(path: &Path, attention: &str) -> Reference {
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let ids = |k: &str| -> Vec<u64> {
         v[k].as_array()
@@ -95,6 +95,7 @@ fn read_reference(path: &Path) -> Reference {
             .map(|x| x.as_u64().unwrap())
             .collect()
     };
+    assert_eq!(v["attention"], attention, "{}", path.display());
     assert_eq!(v["dtype"], "float32", "{}", path.display());
     assert_eq!(v["max_new_tokens"], MAX_NEW_TOKENS, "{}", path.display());
     Reference {
@@ -244,7 +245,10 @@ fn pinned_checkpoint_matches_upstream_windowed_greedy_on_offline_and_streaming_p
         .ok()
         .map(|s| s.parse().unwrap())
         .unwrap_or(2);
-    let step = chunk_seconds * 16_000;
+    let step = chunk_seconds
+        .checked_mul(16_000)
+        .filter(|&samples| samples > 0)
+        .expect("DEVL_QWEN3_ASR_PARITY_CHUNK_SECONDS must be a positive supported duration");
 
     let t = Instant::now();
     let backend = Qwen3AsrBackend::from_checkpoint_dir(
@@ -266,7 +270,7 @@ fn pinned_checkpoint_matches_upstream_windowed_greedy_on_offline_and_streaming_p
     for name in &names {
         eprintln!("== fixture {name}");
         let pcm = read_wav_i16(&dir.join(format!("{name}.wav")));
-        let reference = read_reference(&dir.join(format!("{name}.windowed.json")));
+        let reference = read_reference(&dir.join(format!("{name}.windowed.json")), "windowed");
         assert_eq!(pcm.len(), reference.num_samples, "{name}: fixture mismatch");
 
         let t = Instant::now();
@@ -340,7 +344,7 @@ fn pinned_checkpoint_matches_upstream_windowed_greedy_on_offline_and_streaming_p
         // Contrast only: default sdpa attention attends over the whole clip.
         let global = dir.join(format!("{name}.global.json"));
         if global.exists() {
-            let g = read_reference(&global);
+            let g = read_reference(&global, "global");
             let same = g.ids == reference.ids;
             eprintln!(
                 "  contrast: upstream whole-clip (sdpa) attention ids {} the windowed ids ({} ids)",
