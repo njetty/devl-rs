@@ -30,6 +30,7 @@ cargo check -p devl --all-targets --features metal
 
 ## Engineering & Reporting Standards
 
+- **Signed commits are required on `main`:** Sign all commits with a GitHub-verified SSH, GPG, or S/MIME key (`git config --global commit.gpgsign true`).
 - Keep public items documented (`missing_docs` is enabled workspace-wide) and avoid `unsafe` (`unsafe_code = "forbid"`).
 - Do not include fabricated, extrapolated, or unmeasured latency/WER numbers in docs, PR descriptions, or comments. Only record metrics actually measured locally with reproducible commands.
 - Keep documentation and comments concise and technical.
