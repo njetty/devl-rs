@@ -2,16 +2,18 @@
 //!
 //! Converts 16 kHz mono PCM into 2048-wide audio embeddings and decodes them with a
 //! position-aware KV cache for the pinned `Qwen/Qwen3-ASR-1.7B` checkpoint (see
-//! `docs/ARCHITECTURE.md` Section 6). Prefix KV reuse across audio growth and the
-//! [`devl_core::DevlBackend`] implementation are not part of this module.
+//! `docs/ARCHITECTURE.md` Section 6), and exposes them through [`Qwen3AsrBackend`], the
+//! [`devl_core::DevlBackend`] implementation with reusable audio windows and prefix KV.
 //!
 //! - [`frontend`]: variable-length log-mel features with the global clamp floor.
 //! - [`config`]: audio tower hyperparameters and token-count arithmetic.
 //! - [`encoder`]: the chunked convolution stack and the block-attention transformer.
 //! - [`decoder`]: causal prefill and incremental greedy step over absolute RoPE positions.
 //! - [`kv_cache`]: forkable and truncatable decoder KV cache.
+//! - [`backend`]: the `DevlBackend` implementation and its reuse and invalidation rules.
 //! - [`weights`]: selective, memory-safe loading of `thinker.*` tensors.
 
+pub mod backend;
 pub mod config;
 pub mod decoder;
 pub mod encoder;
@@ -19,6 +21,11 @@ pub mod frontend;
 pub mod kv_cache;
 pub mod weights;
 
+pub use backend::{
+    AUDIO_PAD_ID, DEFAULT_MAX_AUDIO_SAMPLES, EOS_TOKEN_ID, PROMPT_PREFIX_IDS, PROMPT_SUFFIX_IDS,
+    Qwen3AsrAudioEncoding, Qwen3AsrBackend, Qwen3AsrBackendConfig, Qwen3AsrDecodeState,
+    Qwen3AsrEncodeStats,
+};
 pub use config::{
     Qwen3AsrAudioConfig, Qwen3AsrTextConfig, STOP_TOKEN_IDS, conv_output_len, is_stop_token,
 };
@@ -100,6 +107,23 @@ pub enum Qwen3AsrError {
         /// Maximum supported length.
         max: usize,
     },
+
+    /// KV rollback target is outside the retained generated range.
+    #[error(
+        "invalid KV rollback of {requested} generated tokens (prompt_len={prompt_len}, cache length {len})"
+    )]
+    InvalidRollback {
+        /// Requested number of generated tokens to retain.
+        requested: usize,
+        /// Prompt length `P` of the decoder state, `0` if it was never prefilled.
+        prompt_len: usize,
+        /// Cached length at the time of the call.
+        len: usize,
+    },
+
+    /// An encoding and a decoder state, or an encoding and a backend, do not belong together.
+    #[error("mismatched backend state: {0}")]
+    StateMismatch(String),
 
     /// Decoder input does not match the model or the prompt layout.
     #[error("invalid decoder input: {0}")]

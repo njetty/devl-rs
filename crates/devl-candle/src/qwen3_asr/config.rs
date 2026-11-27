@@ -175,8 +175,10 @@ impl Qwen3AsrAudioConfig {
 /// Stop token ids that end generation upstream: `<|im_end|>` then `<|endoftext|>`.
 ///
 /// `generation_config.json` lists both (`docs/ARCHITECTURE.md` Section 6.5). The decoder never
-/// rewrites or maps these ids. Mapping them onto the single
-/// [`devl_core::DevlBackend::eos_token`] is an integration decision (D1 in Section 6.10).
+/// rewrites or maps these ids. [`super::Qwen3AsrBackend`] reports `151645` as
+/// [`devl_core::DevlBackend::eos_token`] and stops on either id through
+/// [`devl_core::DevlBackend::is_eos_token`] (decision D1 in Section 6.10), keeping the generated
+/// id unchanged.
 pub const STOP_TOKEN_IDS: [u32; 2] = [151_645, 151_643];
 
 /// Whether `token` is one of [`STOP_TOKEN_IDS`].

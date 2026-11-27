@@ -57,8 +57,26 @@ pub trait DevlBackend {
     /// internally so [`DevlBackend::rollback_kv`] truncates to `P + accepted_len`.
     type KvCache;
 
-    /// End-of-sequence token ID for this model.
+    /// Canonical end-of-sequence token ID for this model.
+    ///
+    /// Models with a single stop token only implement this method. See
+    /// [`DevlBackend::is_eos_token`] for models that stop on more than one id.
     fn eos_token(&self) -> TokenId;
+
+    /// Whether `token` ends generation.
+    ///
+    /// Every stop decision in `devl-core` (draft acceptance, the resumed decode loop, and
+    /// reported EOS status) goes through this predicate and never compares against
+    /// [`DevlBackend::eos_token`] directly. The original token id is always kept: the
+    /// session returns the stop token the model produced, not [`DevlBackend::eos_token`].
+    ///
+    /// Invariant: `is_eos_token(self.eos_token())` must be `true`, and the answer must not
+    /// depend on mutable state, so that every pass over the same audio stops at the same
+    /// position. The default is `token == self.eos_token()`, which keeps single-stop
+    /// backends source compatible. Wrapper implementations must forward this method.
+    fn is_eos_token(&self, token: TokenId) -> bool {
+        token == self.eos_token()
+    }
 
     /// Expected mono `f32` PCM sample rate in Hz (default: 16,000 Hz).
     fn sample_rate_hz(&self) -> u32 {
@@ -120,6 +138,10 @@ impl<B: DevlBackend + ?Sized> DevlBackend for &B {
         (**self).eos_token()
     }
 
+    fn is_eos_token(&self, token: TokenId) -> bool {
+        (**self).is_eos_token(token)
+    }
+
     fn sample_rate_hz(&self) -> u32 {
         (**self).sample_rate_hz()
     }
@@ -166,6 +188,10 @@ impl<B: DevlBackend + ?Sized> DevlBackend for Arc<B> {
 
     fn eos_token(&self) -> TokenId {
         (**self).eos_token()
+    }
+
+    fn is_eos_token(&self, token: TokenId) -> bool {
+        (**self).is_eos_token(token)
     }
 
     fn sample_rate_hz(&self) -> u32 {

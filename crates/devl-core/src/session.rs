@@ -375,8 +375,7 @@ impl<B: DevlBackend> DevlSession<B> {
     /// non-EOS drafts).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn seed_draft_for_test(&mut self, draft: Vec<TokenId>, audio_samples: usize) {
-        let eos = self.backend.eos_token();
-        self.draft_reached_eos = draft.last() == Some(&eos);
+        self.draft_reached_eos = draft.last().is_some_and(|&t| self.backend.is_eos_token(t));
         self.draft_audio_len = audio_samples;
         self.latest_draft = Some(draft);
         if self.state == SessionState::Idle {
@@ -394,7 +393,7 @@ impl<B: DevlBackend> DevlSession<B> {
     where
         F: FnMut() -> bool,
     {
-        let eos = self.backend.eos_token();
+        let is_eos = |token: TokenId| self.backend.is_eos_token(token);
         let capped_draft = &draft[..draft.len().min(self.config.max_tokens)];
         let k = capped_draft.len();
 
@@ -416,7 +415,7 @@ impl<B: DevlBackend> DevlSession<B> {
                 break;
             }
             accepted_prefix_len += 1;
-            if draft_tok == eos {
+            if is_eos(draft_tok) {
                 accepted_eos = true;
                 break;
             }
@@ -438,7 +437,7 @@ impl<B: DevlBackend> DevlSession<B> {
         let mut decode_steps = 0usize;
         let mut preempted = false;
 
-        while tokens.last() != Some(&eos) && tokens.len() < self.config.max_tokens {
+        while !tokens.last().is_some_and(|&t| is_eos(t)) && tokens.len() < self.config.max_tokens {
             if should_preempt() {
                 preempted = true;
                 break;
@@ -449,7 +448,7 @@ impl<B: DevlBackend> DevlSession<B> {
             decode_steps += 1;
         }
 
-        let reached_eos = tokens.last() == Some(&eos);
+        let reached_eos = tokens.last().is_some_and(|&t| is_eos(t));
 
         Ok(DecodeLoopOutput {
             tokens,

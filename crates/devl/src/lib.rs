@@ -128,4 +128,15 @@ mod tests {
         let res = session.commit().unwrap();
         assert_eq!(res.tokens, vec![7, 8, MOCK_EOS_TOKEN]);
     }
+
+    #[cfg(feature = "candle")]
+    #[test]
+    fn exposes_qwen3_asr_backend_behind_the_candle_feature() {
+        fn assert_backend<B: DevlBackend + Send + Sync>() {}
+        assert_backend::<crate::candle::qwen3_asr::Qwen3AsrBackend>();
+        assert_eq!(
+            crate::candle::qwen3_asr::Qwen3AsrBackendConfig::default().eos_token,
+            151_645
+        );
+    }
 }
