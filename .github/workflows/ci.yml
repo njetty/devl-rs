@@ -4,13 +4,22 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
-  check:
-    name: fmt, clippy, test
+  lint:
+    name: Format, Clippy, Docs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,12 +31,79 @@ jobs:
 
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
 
       - name: Check formatting
         run: cargo fmt --check
 
-      - name: Run clippy
+      - name: Run clippy (default features)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Run tests
+      - name: Run clippy (devl with candle and test-utils)
+        run: cargo clippy -p devl --all-targets --features candle,test-utils -- -D warnings
+
+      - name: Check rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --features devl/candle
+
+  test:
+    name: Test (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runner: ubuntu-latest
+            check_metal: false
+          - label: linux-arm64
+            runner: ubuntu-24.04-arm
+            check_metal: false
+          - label: macos-arm64
+            runner: macos-latest
+            check_metal: true
+          - label: windows-x86_64
+            runner: windows-latest
+            check_metal: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.label }}
+
+      - name: Run workspace tests
         run: cargo test --workspace
+
+      - name: Test devl facade with test-utils
+        run: cargo test -p devl --features test-utils
+
+      - name: Check devl facade with candle backend
+        run: cargo check -p devl --all-targets --features candle
+
+      - name: Check Metal backend (macOS)
+        if: matrix.check_metal
+        run: |
+          cargo check -p devl-candle --all-targets --features metal
+          cargo check -p devl --all-targets --features metal
+
+  package:
+    name: Package Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify crate package manifests
+        run: |
+          cargo package --list -p devl-core
+          cargo package --list -p devl-candle
+          cargo package --list -p devl
