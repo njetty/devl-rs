@@ -5,6 +5,11 @@
 //! framework or networking dependencies. Concrete inference runtimes implement
 //! [`DevlBackend`] in downstream crates (such as `devl-candle`).
 
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/njetty/devl-rs/main/assets/icon-ink.svg",
+    html_favicon_url = "https://raw.githubusercontent.com/njetty/devl-rs/main/assets/icon-ink.svg"
+)]
+
 pub mod backend;
 pub mod scheduler;
 pub mod session;
