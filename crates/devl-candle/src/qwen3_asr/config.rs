@@ -80,7 +80,7 @@ impl Qwen3AsrAudioConfig {
             audio
                 .get(name)
                 .and_then(Value::as_u64)
-                .map(|v| v as usize)
+                .and_then(|v| usize::try_from(v).ok())
                 .ok_or_else(|| {
                     Qwen3AsrError::InvalidConfig(format!("missing integer audio_config.{name}"))
                 })
@@ -134,7 +134,10 @@ impl Qwen3AsrAudioConfig {
         if self.n_window == 0 || self.n_window_infer == 0 {
             return bad("n_window and n_window_infer must be nonzero");
         }
-        if !self.n_window_infer.is_multiple_of(self.chunk_frames()) {
+        let Some(chunk_frames) = self.n_window.checked_mul(2) else {
+            return bad("2 * n_window exceeds the platform limit");
+        };
+        if !self.n_window_infer.is_multiple_of(chunk_frames) {
             return bad("n_window_infer must be a multiple of 2 * n_window");
         }
         Ok(())

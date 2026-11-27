@@ -80,7 +80,7 @@ pub fn read_prefixed_tensors(
             .iter()
             .map(|v| {
                 v.as_u64()
-                    .map(|v| v as usize)
+                    .and_then(|v| usize::try_from(v).ok())
                     .ok_or_else(|| bad("bad shape"))
             })
             .collect::<Result<_, _>>()?;
@@ -91,14 +91,17 @@ pub fn read_prefixed_tensors(
             .ok_or_else(|| bad("no data_offsets"))?;
         let begin = offsets[0].as_u64().ok_or_else(|| bad("bad offset"))?;
         let end = offsets[1].as_u64().ok_or_else(|| bad("bad offset"))?;
-        let numel: usize = shape.iter().product();
-        if end < begin
-            || data_start + end > file_len
-            || (end - begin) as usize != numel * dtype.size_in_bytes()
-        {
+        let bytes = shape
+            .iter()
+            .try_fold(dtype.size_in_bytes(), |bytes, &dim| bytes.checked_mul(dim))
+            .ok_or_else(|| bad("tensor byte length overflows"))?;
+        let length = end
+            .checked_sub(begin)
+            .and_then(|length| usize::try_from(length).ok());
+        if end > file_len - data_start || length != Some(bytes) {
             return Err(bad("data_offsets inconsistent with shape and file size"));
         }
-        let mut buf = vec![0u8; (end - begin) as usize];
+        let mut buf = vec![0u8; bytes];
         file.seek(SeekFrom::Start(data_start + begin))?;
         file.read_exact(&mut buf)?;
         out.insert(
@@ -217,6 +220,20 @@ mod tests {
                 vec![4],
                 1.0_f32.to_le_bytes().to_vec(),
             )],
+        );
+        let err = read_prefixed_tensors(&path, AUDIO_TOWER_PREFIX, &Device::Cpu).unwrap_err();
+        assert!(matches!(err, Qwen3AsrError::InvalidCheckpoint(_)));
+
+        let header = br#"{"thinker.audio_tower.w":{"dtype":"F32","shape":[1],"data_offsets":[18446744073709551611,18446744073709551615]}}"#;
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend(header);
+        std::fs::write(&path, file).unwrap();
+        let err = read_prefixed_tensors(&path, AUDIO_TOWER_PREFIX, &Device::Cpu).unwrap_err();
+        assert!(matches!(err, Qwen3AsrError::InvalidCheckpoint(_)));
+
+        write_safetensors(
+            &path,
+            &[("thinker.audio_tower.w", "F32", vec![usize::MAX, 2], vec![])],
         );
         let err = read_prefixed_tensors(&path, AUDIO_TOWER_PREFIX, &Device::Cpu).unwrap_err();
         assert!(matches!(err, Qwen3AsrError::InvalidCheckpoint(_)));

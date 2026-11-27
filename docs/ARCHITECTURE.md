@@ -677,18 +677,80 @@ Behavior:
 Reference procedure (same pinned environment as 6.7, `float32`, CPU). `qwen3_asr_audio_reference.py` writes the mel features, windowed embeddings, and whole-clip-attention embeddings without running the decoder:
 
 ```python
-{script.rstrip()}
+import argparse, numpy as np, soundfile as sf, torch
+from qwen_asr import Qwen3ASRModel
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--ckpt", required=True)
+ap.add_argument("--wav", required=True)
+ap.add_argument("--out", required=True)
+args = ap.parse_args()
+
+asr = Qwen3ASRModel.from_pretrained(args.ckpt, dtype=torch.float32, device_map="cpu")
+wav, sr = sf.read(args.wav, dtype="float32", always_2d=False)
+assert sr == 16000 and wav.ndim == 1 and len(wav) >= 8000 and np.abs(wav).max() <= 1.0
+
+prompt = asr._build_text_prompt(context="", force_language=None)
+inputs = asr.processor(text=[prompt], audio=[wav], return_tensors="pt", padding=True)
+feats = inputs["input_features"].float()                      # [1, 128, F]
+lens = inputs["feature_attention_mask"].sum(-1)
+tower = asr.model.thinker.audio_tower
+
+def run(windowed):
+    # Default sdpa/eager attention ignores cu_seqlens and attends over the whole clip. The
+    # upstream helper _prepare_attention_mask builds the block-diagonal mask that the
+    # flash_attention_2 varlen path implements, so inject it to get windowed attention.
+    saved = []
+    if windowed:
+        for layer in tower.layers:
+            f = layer.forward
+            saved.append((layer, f))
+            layer.forward = (lambda h, cu, attention_mask=None, _f=f, **kw:
+                             _f(h, cu, attention_mask=tower._prepare_attention_mask(h, cu), **kw))
+    try:
+        with torch.no_grad():
+            return tower(feats[0][:, : lens[0]], feature_lens=lens[:1]).last_hidden_state.float().numpy()
+    finally:
+        for layer, f in saved:
+            layer.forward = f
+
+np.save(args.out + ".mel.npy", feats[0].numpy())
+np.save(args.out + ".audio_embeds.npy", run(True))           # block-windowed attention
+np.save(args.out + ".audio_embeds_global.npy", run(False))   # default sdpa, whole-clip attention
 ```
 
-Fixtures: `full` is a 15.05 s English speech clip converted per 6.7 (240820 samples, one full window and one partial window). The others are derived from it:
-
-```python
-{mk.rstrip()}
-```
-
-`mk.py` writes `crop5s` (500 frames, one partial window), `quiet_head` (first 8 s scaled by 0.05, so the global maximum moves into the second window), and `long36s` (full clip, then the `quiet_head` clip, then 6.25 s of the full clip: 3635 frames, four full windows and one partial). Run the script once per clip with `--ckpt ckpt --wav <name>.wav --out <name>`, then:
+Fixtures: `full` is the English demo clip linked in the pinned checkpoint's model card, converted to 16 kHz mono PCM16 (240820 samples, one full window and one partial window). Prepare it with:
 
 ```bash
+mkdir -p fixtures
+curl -fsSL https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_en.wav -o asr_en.wav
+ffmpeg -i asr_en.wav -ac 1 -ar 16000 -sample_fmt s16 fixtures/full.wav
+sha256sum fixtures/full.wav
+# bd5653f91260b80949a4d5053ac52cc58f26eb88f31768fd65112dd110e22035
+```
+
+Save the following as `mk.py` and run `python mk.py fixtures` to derive the remaining fixtures:
+
+```python
+import sys, numpy as np, soundfile as sf
+d = sys.argv[1]
+w, sr = sf.read(d + "/full.wav", dtype="float32"); assert sr == 16000
+sf.write(d + "/crop5s.wav", w[:80000], 16000, subtype="PCM_16")
+q = w.copy(); q[:128000] *= 0.05
+sf.write(d + "/quiet_head.wav", q, 16000, subtype="PCM_16")
+c = np.concatenate([w, q, w[:100000]])  # 15.05+15.05+6.25 s
+sf.write(d + "/long36s.wav", c, 16000, subtype="PCM_16")
+print(len(c), np.abs(c).max(), np.abs(w).max())
+```
+
+`mk.py` writes `crop5s` (500 frames, one partial window), `quiet_head` (first 8 s scaled by 0.05, so the global maximum moves into the second window), and `long36s` (full clip, then the `quiet_head` clip, then 6.25 s of the full clip: 3635 frames, four full windows and one partial). Generate the reference arrays and run the Rust comparison:
+
+```bash
+for name in full crop5s quiet_head long36s; do
+  python qwen3_asr_audio_reference.py --ckpt ckpt \
+    --wav "fixtures/$name.wav" --out "fixtures/$name"
+done
+
 DEVL_QWEN3_ASR_CKPT=ckpt DEVL_QWEN3_ASR_FIXTURES=fixtures \
   cargo test -p devl-candle --release --test qwen3_asr_reference -- --nocapture
 ```
