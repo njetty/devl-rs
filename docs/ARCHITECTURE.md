@@ -340,6 +340,8 @@ Per Section 2 (item 4) and Section 3 of arXiv:2611.20064v1, TTFS is minimized un
    - Encoding and verification run before the first preemption check. During autoregressive decoding, a draft can yield between token steps. Commits are dequeued in FIFO order and do not run the preemption check.
 4. **RAII slot accounting & shutdown**:
    - Dequeuing a job returns a `ScheduledJob` paired with a `JobPermit` whose `Drop` implementation decrements `active_drafts` / `active_commits` and wakes waiting workers via `Condvar`.
+   - `cancel_stream(stream_id)` removes every queued job for a stream (returning the payloads so their destructors run outside the scheduler lock) and marks the stream's executing drafts for preemption. It does not interrupt an executing commit and does not change other streams' jobs or ordering.
+   - Per-stream cancellation metadata (the latest commit or cancel sequence used by `should_preempt_draft`) is retained only while the stream has an executing draft, and is dropped when that draft's permit is released. The map is therefore bounded by `max_concurrent_drafts` and does not grow with completed streams (`tracked_streams()` exposes the size).
    - `shutdown()` wakes all blocked `next_job()` callers once queues drain (or immediately when empty).
 
 ---

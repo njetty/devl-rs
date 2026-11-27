@@ -40,18 +40,24 @@
 //! # Teardown
 //!
 //! Cancel, close, disconnect, final, error, and shutdown all end a stream the
-//! same way: the pending buffer is cleared, the `DevlSession` is dropped (by
-//! the worker if one is mid-job), the stream leaves the registry, and its slot
-//! is reusable. Jobs for ended streams still sitting in the scheduler queue are
-//! discarded as no-ops when dequeued; the scheduler exposes no removal API and
-//! the coordinator does not add scheduling policy. Scheduler permits are RAII
-//! and are released when each job finishes, including on panic.
+//! same way: the pending buffer is cleared, the stream's queued scheduler jobs
+//! are removed with `PriorityScheduler::cancel_stream`, the `DevlSession` is
+//! dropped (by the worker if one is mid-job), and only then does the stream
+//! leave the registry and its slot become reusable. A stream whose job is
+//! still executing keeps its slot until the worker retires it, so queued plus
+//! running jobs never exceed `max_streams` streams' worth (one draft and one
+//! commit each) regardless of open/cancel churn. Scheduler permits are RAII
+//! and are released when each job finishes, including on panic. Scheduler
+//! per-stream metadata is dropped when the stream's last draft stops, so it
+//! does not grow with the number of completed streams. Pending `Partial`
+//! events are discarded when a terminal event is queued.
 //!
 //! # Limits
 //!
 //! `DevlSession::commit` has no preemption hook. A commit already running when
 //! a stream is cancelled or the coordinator shuts down runs to completion and
-//! its result is discarded.
+//! its result is discarded, and its stream keeps an admission slot until it
+//! returns.
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -135,6 +141,9 @@ pub struct CoordinatorStats {
     pub active_commits: usize,
     /// Executing draft jobs (held scheduler permits).
     pub active_drafts: usize,
+    /// Streams with retained scheduler cancellation metadata. Bounded by the
+    /// concurrent draft limit, independent of completed streams.
+    pub tracked_streams: usize,
 }
 
 fn plock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -283,6 +292,7 @@ where
             pending_drafts: s.scheduler.pending_drafts(),
             active_commits: s.scheduler.active_commits(),
             active_drafts: s.scheduler.active_drafts(),
+            tracked_streams: s.scheduler.tracked_streams(),
         }
     }
 
@@ -417,8 +427,10 @@ where
                 self.pump(false);
             }
             Accepted::Commit => {
-                st.committing = true;
-                self.ctx.scheduler.submit_commit(self.id, Arc::clone(self));
+                if !st.done {
+                    st.committing = true;
+                    self.ctx.scheduler.submit_commit(self.id, Arc::clone(self));
+                }
             }
             Accepted::Cancel => {
                 self.emit_locked(&mut st, ServerEvent::Cancelled);
@@ -478,15 +490,26 @@ where
         self.release_session(false);
     }
 
-    /// Drop the session and leave the registry if the stream has ended.
+    /// Retire an ended stream: remove its queued jobs, drop its session, and
+    /// free its registry slot.
     ///
-    /// `blocking = false` skips the session if a worker holds it; that worker
-    /// calls this again with `blocking = true` after its job, so the session
-    /// is always released by whichever side finishes last.
+    /// Queued jobs are removed from the scheduler immediately
+    /// ([`PriorityScheduler::cancel_stream`]), so ended streams never leave
+    /// payloads behind in the queues. The registry slot is freed only once the
+    /// session is actually released. `blocking = false` skips the session if a
+    /// worker holds it; that worker calls this again with `blocking = true`
+    /// after its job. A stream that is still executing therefore keeps its
+    /// admission slot until the worker retires, which bounds live sessions
+    /// (queued, running, or retiring) by `max_streams`.
+    ///
+    /// Lock order: no `state` lock is held here. The scheduler lock is taken
+    /// only inside `cancel_stream` and never while holding `session`, and
+    /// removed payloads are dropped after the scheduler lock is released.
     fn release_session(&self, blocking: bool) {
         if !self.closed.load(Ordering::Acquire) {
             return;
         }
+        drop(self.ctx.scheduler.cancel_stream(self.id));
         let session = if blocking {
             Some(plock(&self.session))
         } else {
@@ -500,8 +523,8 @@ where
             let released = guard.take();
             drop(guard);
             drop(released);
+            plock(&self.ctx.registry).streams.remove(&self.id);
         }
-        plock(&self.ctx.registry).streams.remove(&self.id);
     }
 
     /// Move pending audio into the session and release credit.

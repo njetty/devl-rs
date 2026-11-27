@@ -468,8 +468,10 @@ fn cancel_during_draft_stops_partials_and_releases_everything() {
         s.send(&audio(1, 8)).unwrap_err().code,
         ErrorCode::InvalidMessageOrder
     );
-    assert_eq!(c.stats().open_streams, 0);
+    // The running draft holds the slot until the worker retires.
+    assert_eq!(c.stats().open_streams, 1);
     gate.release();
+    wait_open_streams(&c, 0);
 
     c.shutdown();
     let mut events = Vec::new();
@@ -534,9 +536,11 @@ fn disconnect_releases_session_and_frees_the_slot() {
     );
 
     drop(s);
-    assert_eq!(c.stats().open_streams, 0);
-    let replacement = start(&c);
+    // The running draft still holds the slot until the worker retires.
+    assert_eq!(c.stats().open_streams, 1);
     gate.release();
+    wait_open_streams(&c, 0);
+    let replacement = start(&c);
     drop(replacement);
     assert_clean(&c, &live);
 }
@@ -715,4 +719,180 @@ fn stream_ids_are_unique_per_open() {
     sorted.sort_by_key(|id| id.0);
     sorted.dedup();
     assert_eq!(sorted.len(), ids.len());
+}
+
+/// Poll until the registry drains or fail after `WAIT`.
+fn wait_open_streams(c: &Coord, n: usize) {
+    let deadline = std::time::Instant::now() + WAIT;
+    while c.stats().open_streams != n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "registry never drained"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn queued_cancellations_cannot_accumulate_behind_a_busy_worker() {
+    let (mock, gate) = gated(vec![(8, vec![1, 2, 3, MOCK_EOS_TOKEN])], 1);
+    let (c, live) = coordinator(
+        mock,
+        CoordinatorConfig {
+            max_streams: 2,
+            draft_cadence_samples: 8,
+            ..config()
+        },
+    );
+    // Stream A parks the only worker inside a draft.
+    let a = start(&c);
+    a.send(&audio(0, 8)).unwrap();
+    gate.wait_entered();
+    let base = c.stats();
+    assert_eq!(base.open_streams, 1);
+    assert_eq!((base.pending_commits, base.pending_drafts), (0, 0));
+
+    for round in 0..50 {
+        let b = start(&c);
+        b.send(&audio(0, 8)).unwrap();
+        // Queue a commit, then cancel it while the worker is busy elsewhere.
+        b.send(&commit(1)).unwrap();
+        assert_eq!(c.stats().pending_commits, 1, "round {round}");
+        b.send(&ClientMessage::Cancel).unwrap();
+        let s = c.stats();
+        assert_eq!(
+            (s.pending_commits, s.pending_drafts, s.open_streams),
+            (0, 0, 1),
+            "round {round}"
+        );
+        // A queued draft that is cancelled directly is removed too.
+        let d = start(&c);
+        d.send(&audio(0, 8)).unwrap();
+        assert_eq!(c.stats().pending_drafts, 1, "round {round}");
+        drop(d);
+        let s = c.stats();
+        assert_eq!(
+            (s.pending_commits, s.pending_drafts, s.open_streams),
+            (0, 0, 1),
+            "round {round}"
+        );
+    }
+    // Admission was never exceeded and counters are back at baseline.
+    assert!(c.open_stream().is_ok());
+    gate.release();
+    drop(a);
+    wait_open_streams(&c, 1);
+    assert_eq!(c.stats().active_commits, 0);
+    c.shutdown();
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn running_cancellation_holds_its_slot_until_the_worker_retires() {
+    let (mock, gate) = gated(vec![(8, vec![1, 2, 3, MOCK_EOS_TOKEN])], 1);
+    let (c, live) = coordinator(
+        mock,
+        CoordinatorConfig {
+            max_streams: 1,
+            ..config()
+        },
+    );
+    let s = start(&c);
+    s.send(&audio(0, 8)).unwrap();
+    s.send(&commit(1)).unwrap();
+    gate.wait_entered();
+    s.send(&ClientMessage::Cancel).unwrap();
+    // The commit cannot be interrupted, so the slot stays occupied.
+    assert_eq!(c.stats().open_streams, 1);
+    assert_eq!(c.stats().active_commits, 1);
+    assert_eq!(
+        c.open_stream().err(),
+        Some(CoordinatorError::TooManyStreams { max: 1 })
+    );
+    gate.release();
+    wait_open_streams(&c, 0);
+    let t = start(&c);
+    drop(t);
+    drop(s);
+    assert_clean(&c, &live);
+}
+
+#[test]
+fn scheduler_metadata_does_not_grow_per_completed_stream() {
+    let (c, live) = coordinator(
+        MockBackend::with_transcripts([(8, vec![1, 2, MOCK_EOS_TOKEN])]),
+        CoordinatorConfig {
+            draft_cadence_samples: 8,
+            ..config()
+        },
+    );
+    for _ in 0..40 {
+        let s = start(&c);
+        s.send(&audio(0, 8)).unwrap();
+        s.send(&commit(1)).unwrap();
+        let events = until_terminal(&s);
+        assert!(matches!(events.last(), Some(ServerEvent::Final { .. })));
+    }
+    for _ in 0..40 {
+        let s = start(&c);
+        s.send(&audio(0, 8)).unwrap();
+        s.send(&ClientMessage::Cancel).unwrap();
+    }
+    wait_open_streams(&c, 0);
+    let s = c.stats();
+    assert_eq!(s.tracked_streams, 0);
+    assert_eq!(
+        (
+            s.pending_commits,
+            s.pending_drafts,
+            s.active_commits,
+            s.active_drafts
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_clean(&c, &live);
+}
+
+#[test]
+fn cancel_discards_unread_partial_and_late_sends_are_inert() {
+    let (mock, gate) = gated(vec![(8, vec![1, 2, 3, MOCK_EOS_TOKEN])], 1);
+    let (c, live) = coordinator(
+        mock,
+        CoordinatorConfig {
+            draft_cadence_samples: 8,
+            ..config()
+        },
+    );
+    let s = start(&c);
+    s.send(&audio(0, 8)).unwrap();
+    gate.wait_entered();
+    gate.release();
+    // Wait until the draft has published a partial, without reading it.
+    let deadline = std::time::Instant::now() + WAIT;
+    while c.stats().active_drafts != 0 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    s.send(&ClientMessage::Cancel).unwrap();
+    let mut events = Vec::new();
+    while let Some(e) = s.try_recv_event() {
+        events.push(e);
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Partial { .. })),
+        "stale partial survived cancel: {events:?}"
+    );
+    assert_eq!(events.last(), Some(&ServerEvent::Cancelled));
+    // Commit and cancel after the terminal event do not schedule or emit.
+    assert_eq!(
+        s.send(&commit(1)).unwrap_err().code,
+        ErrorCode::InvalidMessageOrder
+    );
+    s.send(&ClientMessage::Cancel).unwrap();
+    assert_eq!(c.stats().pending_commits, 0);
+    assert!(s.try_recv_event().is_none());
+    drop(s);
+    assert_clean(&c, &live);
 }

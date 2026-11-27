@@ -48,7 +48,16 @@ impl EventQueue {
                     None => q.push_back(ServerEvent::Credit { samples }),
                 }
             }
-            other => q.push_back(other),
+            other => {
+                // A terminal event supersedes any unread partial.
+                if matches!(
+                    other,
+                    ServerEvent::Final { .. } | ServerEvent::Cancelled | ServerEvent::Error(_)
+                ) {
+                    q.retain(|e| !matches!(e, ServerEvent::Partial { .. }));
+                }
+                q.push_back(other);
+            }
         }
         self.ready.notify_all();
     }

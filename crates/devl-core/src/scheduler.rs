@@ -46,9 +46,14 @@ struct QueueState<T> {
     draft_queue: VecDeque<QueuedJob<T>>,
     active_commits: usize,
     active_drafts: usize,
-    /// Most recent commit sequence number per stream, used to cancel older
-    /// in-flight drafts for the same stream without ABA races.
+    /// Most recent commit (or cancel) sequence number per stream, used to
+    /// cancel older in-flight drafts for the same stream without ABA races.
+    /// An entry exists only while the stream has an executing draft that could
+    /// observe it, so the map is bounded by `max_concurrent_drafts`.
     last_commit_seq: HashMap<StreamId, u64>,
+    /// Executing drafts per stream; the retention condition for
+    /// `last_commit_seq` entries.
+    active_draft_streams: HashMap<StreamId, usize>,
     shutdown: bool,
 }
 
@@ -146,6 +151,7 @@ impl<T: Send + 'static> PriorityScheduler<T> {
                     active_commits: 0,
                     active_drafts: 0,
                     last_commit_seq: HashMap::new(),
+                    active_draft_streams: HashMap::new(),
                     shutdown: false,
                 }),
                 condvar: Condvar::new(),
@@ -171,10 +177,7 @@ impl<T: Send + 'static> PriorityScheduler<T> {
 
         // Evict stale queued drafts for this stream.
         state.draft_queue.retain(|job| job.stream_id != stream_id);
-        state.last_commit_seq.insert(stream_id, seq);
-        self.inner
-            .has_cancelled_streams
-            .store(true, Ordering::Release);
+        self.record_cancel_locked(&mut state, stream_id, seq);
 
         state.commit_queue.push_back(QueuedJob {
             stream_id,
@@ -222,6 +225,53 @@ impl<T: Send + 'static> PriorityScheduler<T> {
             .last_commit_seq
             .get(&stream_id)
             .is_some_and(|&commit_seq| commit_seq > draft_seq)
+    }
+
+    /// Remove every queued job for `stream_id` and preempt its running drafts.
+    ///
+    /// Queued commits and drafts for the stream are dropped from the queues
+    /// and returned to the caller, so payload destructors run outside the
+    /// scheduler lock. A draft already executing for the stream observes
+    /// [`Self::should_preempt_draft`] as `true`; an executing commit is not
+    /// interrupted. Other streams' jobs, ordering, and the counters of
+    /// executing jobs are unchanged. Cancelling a stream with no jobs is a
+    /// no-op that retains no state.
+    pub fn cancel_stream(&self, stream_id: StreamId) -> Vec<T> {
+        let mut removed = Vec::new();
+        let mut state = self.inner.state.lock().expect("scheduler mutex poisoned");
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        let mut keep = VecDeque::with_capacity(state.commit_queue.len());
+        for job in state.commit_queue.drain(..) {
+            if job.stream_id == stream_id {
+                self.inner.pending_commits.fetch_sub(1, Ordering::AcqRel);
+                removed.push(job.payload);
+            } else {
+                keep.push_back(job);
+            }
+        }
+        state.commit_queue = keep;
+        let mut keep = VecDeque::with_capacity(state.draft_queue.len());
+        for job in state.draft_queue.drain(..) {
+            if job.stream_id == stream_id {
+                removed.push(job.payload);
+            } else {
+                keep.push_back(job);
+            }
+        }
+        state.draft_queue = keep;
+        self.record_cancel_locked(&mut state, stream_id, seq);
+        // Queue contents shrank: wake workers so shutdown can observe empty queues.
+        self.inner.condvar.notify_all();
+        drop(state);
+        removed
+    }
+
+    /// Number of streams with retained cancellation metadata. Bounded by
+    /// `max_concurrent_drafts`; exposed for leak checks.
+    pub fn tracked_streams(&self) -> usize {
+        let state = self.inner.state.lock().expect("scheduler mutex poisoned");
+        state.last_commit_seq.len() + state.active_draft_streams.len()
     }
 
     /// Non-blocking dequeue of the highest-priority runnable job.
@@ -297,11 +347,22 @@ impl<T: Send + 'static> PriorityScheduler<T> {
             .active_drafts
     }
 
+    /// Record a cancel/commit marker, but only if an executing draft of the
+    /// stream could observe it. Drafts dequeued later carry a newer sequence.
+    fn record_cancel_locked(&self, state: &mut QueueState<T>, stream_id: StreamId, seq: u64) {
+        if state.active_draft_streams.contains_key(&stream_id) {
+            state.last_commit_seq.insert(stream_id, seq);
+            self.inner
+                .has_cancelled_streams
+                .store(true, Ordering::Release);
+        }
+    }
+
     fn pop_runnable_locked(&self, state: &mut QueueState<T>) -> Option<ScheduledJob<T>> {
         if let Some(job) = state.commit_queue.pop_front() {
             self.inner.pending_commits.fetch_sub(1, Ordering::AcqRel);
             state.active_commits += 1;
-            let permit = self.make_permit(JobPriority::Commit);
+            let permit = self.make_permit(JobPriority::Commit, None);
             return Some(ScheduledJob {
                 stream_id: job.stream_id,
                 priority: JobPriority::Commit,
@@ -315,7 +376,8 @@ impl<T: Send + 'static> PriorityScheduler<T> {
             && let Some(job) = state.draft_queue.pop_front()
         {
             state.active_drafts += 1;
-            let permit = self.make_permit(JobPriority::Draft);
+            *state.active_draft_streams.entry(job.stream_id).or_insert(0) += 1;
+            let permit = self.make_permit(JobPriority::Draft, Some(job.stream_id));
             return Some(ScheduledJob {
                 stream_id: job.stream_id,
                 priority: JobPriority::Draft,
@@ -328,7 +390,7 @@ impl<T: Send + 'static> PriorityScheduler<T> {
         None
     }
 
-    fn make_permit(&self, priority: JobPriority) -> JobPermit {
+    fn make_permit(&self, priority: JobPriority, stream_id: Option<StreamId>) -> JobPermit {
         let inner = Arc::clone(&self.inner);
         JobPermit {
             on_drop: Some(Box::new(move || {
@@ -339,6 +401,18 @@ impl<T: Send + 'static> PriorityScheduler<T> {
                     }
                     JobPriority::Draft => {
                         state.active_drafts = state.active_drafts.saturating_sub(1);
+                        if let Some(id) = stream_id
+                            && let Some(n) = state.active_draft_streams.get_mut(&id)
+                        {
+                            *n -= 1;
+                            if *n == 0 {
+                                state.active_draft_streams.remove(&id);
+                                state.last_commit_seq.remove(&id);
+                            }
+                        }
+                        if state.last_commit_seq.is_empty() {
+                            inner.has_cancelled_streams.store(false, Ordering::Release);
+                        }
                     }
                 }
                 inner.condvar.notify_all();
