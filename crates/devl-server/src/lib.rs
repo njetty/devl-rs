@@ -5,7 +5,9 @@
 //! state machine ([`StreamContract`]). It performs no I/O, owns no async
 //! runtime, and contains no inference or verification logic. WebSocket/HTTP
 //! adapters, the scheduler coordinator, and backend integration are separate
-//! work that consume these types.
+//! work that consume these types. The [`coordinator`] module is the first such
+//! consumer: it owns one `DevlSession` per stream and drives it through
+//! `PriorityScheduler`.
 //!
 //! Protocol logic (verification, rollback, commit-over-draft scheduling)
 //! stays in `devl-core`. The contract only decides which messages are legal,
@@ -19,12 +21,17 @@
     html_favicon_url = "https://raw.githubusercontent.com/njetty/devl-rs/main/assets/icon-ink.svg"
 )]
 
+pub mod coordinator;
 pub mod error;
+mod events;
 pub mod frame;
 pub mod limits;
 pub mod message;
 pub mod state;
 
+pub use coordinator::{
+    Coordinator, CoordinatorConfig, CoordinatorError, CoordinatorStats, Detokenizer, StreamSession,
+};
 pub use devl_core::StreamId;
 pub use error::{ErrorCode, StreamError};
 pub use frame::{FRAME_HEADER_LEN, decode_audio_frame, decode_samples, encode_audio_frame};

@@ -1,6 +1,6 @@
 # `devl-server` Streaming Contract
 
-Status: contract version `1.0`, implemented in `crates/devl-server` as types, binary audio framing, limits, and a validating per-stream state machine. Endpoint adapters, the scheduler coordinator, backend integration, endpointing, authentication, and deployment are not implemented; see [Boundaries](#boundaries).
+Status: contract version `1.0`, implemented in `crates/devl-server` as types, binary audio framing, limits, and a validating per-stream state machine. The session coordinator (`Coordinator`, `StreamSession`) drives per-stream sessions through `PriorityScheduler`. Endpoint adapters, backend selection, endpointing, authentication, and deployment are not implemented; see [Boundaries](#boundaries).
 
 The contract is transport-neutral. It defines what a client and server may say to each other for one stream, not how bytes travel. Control message serialization (JSON, protobuf, or other) is chosen by endpoint adapters. Audio has a defined byte layout.
 
@@ -120,11 +120,11 @@ In this crate (`devl-server`):
 
 - Message, format, limit, and error types; audio envelope encode/decode; PCM to `f32` conversion.
 - `StreamContract`, a state machine with no I/O that validates client messages (`receive`) and server events (`emit`).
+- `Coordinator` and `StreamSession`: a worker pool that owns one `DevlSession` per stream, submits drafts and commits to `PriorityScheduler`, and releases credit. See [Coordinator](#coordinator).
 
 Not in this crate yet, each owned by later issues:
 
 - WebSocket/HTTP endpoint adapters and control message serialization.
-- Coordinator that owns a `DevlSession` per stream, submits drafts and commits to `PriorityScheduler`, and releases credit.
 - Backend integration and selection.
 - VAD and endpointing. Today the client decides when to `Commit`.
 - Authentication, TLS, rate limiting, and deployment.
@@ -141,4 +141,16 @@ An adapter owns the transport and one `StreamContract` per stream. For each inbo
 - `Cancel`: cancel the stream's jobs and reply `Cancelled`.
 - `Err(e)`: emit `Error(e)` and stop accepting input.
 
-Checkpoint cadence matters because encoding and verification run before the first preemption check (see `docs/ARCHITECTURE.md`, Section 6.10 D6); the coordinator issue should document the cadence it chooses.
+Checkpoint cadence matters because encoding and verification run before the first preemption check (see `docs/ARCHITECTURE.md`, Section 6.10 D6). The coordinator submits a draft every `draft_cadence_samples` accepted samples (default 32000, 2 s at 16 kHz).
+
+## Coordinator
+
+`Coordinator::new(backend, detokenizer, config)` starts a fixed worker pool over one `PriorityScheduler`. `open_stream` returns a `StreamSession`, the connection-side handle for one stream: `send(&ClientMessage)` runs the contract and the coordinator, and `try_recv_event` / `recv_event_timeout` read `ServerEvent`s. The API is synchronous and std-only; adapters bridge it to their runtime. Scheduling and verification are not reimplemented: drafts run `DevlSession::run_draft_cancellable` with `PriorityScheduler::should_preempt_draft`, finals run `DevlSession::commit`, and job order is `PriorityScheduler::next_job`.
+
+- **Isolation.** Each stream owns its `DevlSession`, contract, pending audio, and event queue. Stream ids are assigned by the coordinator.
+- **Final over draft.** `Commit` calls `submit_commit`, which evicts the stream's queued draft and flags its running draft for preemption. A running draft yields at the next step boundary; encoding and verification before the first check are not interruptible.
+- **Stale partials.** A partial is dropped if the stream has committed, was cancelled or failed, covers less audio than an earlier partial, or repeats the previous text. A draft preempted by another stream's commit still publishes its verified prefix.
+- **Backpressure.** Audio waits in a pending buffer only while a worker holds the session. `Credit` is granted when the buffer is drained into the session, so pending audio never exceeds granted credit and overrunning credit is `backpressure_violation`. Outbound events use a bounded queue that keeps one pending partial and one pending credit grant. Queued jobs are at most one draft and one commit per stream, and open streams are capped by `max_streams`.
+- **Teardown.** Cancel, close, disconnect (dropping the handle), final, error, and shutdown clear pending audio, drop the session (the worker does so if mid-job), and free the stream slot. Queued jobs of ended streams are discarded as no-ops when dequeued; `PriorityScheduler` has no removal API. Job permits are RAII and release on every path including panics, which fail only the affected stream with `internal`.
+- **Shutdown.** `Coordinator::shutdown` stops admission, fails open streams with `internal`, and joins the workers. `DevlSession::commit` has no preemption hook, so a commit already running finishes and its result is discarded. The same applies to a commit-phase `Cancel`.
+- **Draft errors.** A backend error inside a draft is non-fatal and emits nothing; the commit pass re-runs the work and reports any persistent failure.

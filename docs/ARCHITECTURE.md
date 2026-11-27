@@ -40,10 +40,10 @@ DEVL converts offline speech recognition models into low-latency streaming recog
   - Depends on `devl-core`, `candle-core`, `candle-nn`, and `candle-transformers`, with optional `metal` and `cuda` feature flags.
   - Owns model loading, deterministic audio feature extraction, device placement, KV-cache management/truncation, and the `DevlBackend` implementation for local Whisper inference.
   - Must not re-implement prefix verification, rollback selection, draft loop orchestration, or commit-over-draft scheduling; all protocol logic lives in `devl-core`.
-- **`crates/devl-server`** (contract scaffold; unpublished):
-  - Depends on `devl-core` and `thiserror` only. No async runtime, networking, or backend dependencies yet.
-  - Owns the versioned streaming contract (message vocabulary, audio framing, limits, backpressure, cancellation) and a validating per-stream state machine. See [SERVER_CONTRACT.md](SERVER_CONTRACT.md).
-  - Planned, not implemented: endpoint adapters, the coordinator bridging streams to `DevlSession` and `PriorityScheduler`, backend selection, VAD/endpointing hooks, and telemetry. It must not duplicate verification, rollback, or scheduling logic from `devl-core`.
+- **`crates/devl-server`** (unpublished):
+  - Depends on `devl-core` and `thiserror` only. No async runtime, networking, or backend dependencies (`devl-core` with `test-utils` is a dev-dependency for tests).
+  - Owns the versioned streaming contract (message vocabulary, audio framing, limits, backpressure, cancellation), a validating per-stream state machine, and the session coordinator that owns one `DevlSession` per stream and drives it through `PriorityScheduler` on a bounded worker pool. See [SERVER_CONTRACT.md](SERVER_CONTRACT.md).
+  - Planned, not implemented: endpoint adapters, backend selection, VAD/endpointing hooks, and telemetry. It must not duplicate verification, rollback, or scheduling logic from `devl-core`.
 
 ---
 
@@ -656,7 +656,7 @@ None of these is implemented here. Each must be settled in the issue that needs 
 - **D3, prior encoding validation (no trait change). Resolved in 6.15.** The trait accepts any `&AudioEncoding` as prior. The backend must store and check fingerprints (6.8). Decide the fingerprint (full compare of retained samples versus a hash).
 - **D4, supported duration bounds (no trait change). Resolved in 6.15.** Minimum 8000 samples (pad) and maximum 1200 s (`MAX_ASR_INPUT_SECONDS`) match upstream. At 13 tokens per second, 1200 s is 15600 audio tokens in one prefill. Decide whether v0.2.0 enforces a smaller cap and which `Error` variant reports it.
 - **D5, cached-state ownership (no trait change). Resolved in 6.15.** `AudioEncoding` will hold reference-counted per-block K/V. `new_kv_cache()` takes no encoding, so `verify_draft` performs the seeding. Confirm that `AudioEncoding: Send` (and `Sync` where `PriorityScheduler` shares it) holds for Candle tensors on all supported devices before choosing the representation.
-- **D6, pre-emption granularity (no trait change, scheduler note).** `encode_audio` and `verify_draft` run before the first `should_preempt` check (Section 4). With a reusable prefix, encoder and prefix prefill work scales with uncached blocks. Whole-buffer mel and cache validation still scale with clip length, and invalidation can require rebuilding the entire prefix. No change is proposed, but checkpoint cadence should be documented in the server issue.
+- **D6, pre-emption granularity (no trait change, scheduler note).** `encode_audio` and `verify_draft` run before the first `should_preempt` check (Section 4). With a reusable prefix, encoder and prefix prefill work scales with uncached blocks. Whole-buffer mel and cache validation still scale with clip length, and invalidation can require rebuilding the entire prefix. No change is proposed. The `devl-server` coordinator documents its checkpoint cadence (`draft_cadence_samples`, default 32000 samples).
 - **D7, frontend reuse (no trait change).** The existing `mel.rs` pads to 30 s and supports 80 or 128 bins. Qwen3 needs a variable-length 128-bin frontend with the global-floor semantics of 6.3. Whether `candle_transformers` `pcm_to_mel` can be made to match without padding is unverified (see 6.12).
 
 ### 6.11 Consistency Check with Current Protocol Signatures
