@@ -364,7 +364,7 @@ Per Section 2 (item 4) and Section 3 of arXiv:2611.20064v1, TTFS is minimized un
 
 ## 6. Qwen3-ASR Compatibility Contract (v0.2.0)
 
-This section fixes the model and offline reference contract for the planned Qwen3-ASR backend in `devl-candle`. It is a specification only. No model execution, loader, frontend, or trait change is implemented by it.
+This section fixes the model and offline reference contract for the planned Qwen3-ASR backend in `devl-candle`. Subsections 6.1 to 6.12 are a specification. 6.13 and 6.14 describe the implemented audio path and decoder. No trait change is made by any of it.
 
 Conventions used below:
 
@@ -774,3 +774,37 @@ Tolerances enforced by the opt-in test, set above the observed errors:
 | `bfloat16` | not measured | not measured | not measured |
 
 The mel error is dominated by `f32` accumulation order in the reference and grows slowly with clip length. A `bfloat16` tolerance must be measured on a backend that supports it and is left to the parity issue.
+
+### 6.14 Text Decoder and KV Rollback (Implemented)
+
+Implemented in `crates/devl-candle/src/qwen3_asr/` (`decoder`, `kv_cache`, `weights`, `config`). Scope is the decoder only: embeddings in, logits and greedy ids out. The `DevlBackend` implementation, prefix KV reuse across audio growth, and prompt tokenization are not part of it.
+
+Behavior:
+
+- Structure: token embedding, 28 pre-norm layers (RMSNorm, grouped-query attention with `q_norm` and `k_norm` before RoPE, gated SiLU MLP), final RMSNorm, bias-free head. The head uses `thinker.lm_head.weight` when present and the embedding matrix otherwise.
+- Positions: rotate-half 1-D RoPE at absolute positions. The position of a fed token is the cache length at that moment, so rollback needs no offset state (6.6). Cos and sin are computed per call for `len..len + n`, with no limit other than `max_position_embeddings`.
+- Cache: `Qwen3AsrKvCache` holds post-RoPE keys and values per layer. `fork` shares tensors, appends allocate new tensors, and `truncate(n)` narrows a view, so forks never observe each other. `truncate` rejects `n > len` with `InvalidCacheLength` and leaves the cache unchanged. A forward pass updates the cache only after every layer succeeds. The decoder does not know the prompt length, so callers truncate to `P + n`.
+- API: `embed_prompt` splices audio embeddings into the prompt at `<|audio_pad|>` positions, `extend` appends without logits, `prefill(embeds, cache, logit_rows)` returns `f32` logits for the last rows only, `step` and `step_logits` feed one token, and `argmax_rows` selects greedily with ties to the lowest id and an error on NaN. No logit suppression applies.
+- Stop ids: `STOP_TOKEN_IDS` lists both upstream ids, `151645` and `151643`, and `is_stop_token` tests either. The decoder never maps or rewrites ids. Reducing them to the single `DevlBackend::eos_token` is decision D1 and belongs to backend integration.
+- Loader: `Qwen3AsrDecoder::from_checkpoint_dir` requires both pinned shard names and byte sizes and a `text_config` equal to the pinned one, then reads only `thinker.model.*` and `thinker.lm_head.*`. It never reads the audio tower. The shared reader also checks that every indexed tensor exists in its shard. Shard sizes are a guard, not a hash. Verify the sha256 values in 6.1 outside the process.
+- Dtype: only `f32` is exercised, as in 6.13.
+- Attention mode: the decoder is agnostic to how audio embeddings were made. Synthetic tests use text tokens and random embeddings. The real-checkpoint run uses this crate's block-windowed encoder. For a clip of at most one 8 s block that equals the upstream default whole-clip attention (6.4, 6.13), so only such a clip is decoder-equivalent to the default upstream reference. Longer clips differ between the two audio attention modes and must be compared against the matching reference from 6.13.
+- Known limit: attention scores for a prefill of `n` tokens are materialized as `heads x n x n` in `f32`. Very long prefills (up to 15600 audio tokens) need query blocking, which is left to the integration issue.
+
+Tests: `tests/qwen3_asr_decoder.rs` runs in CI with synthetic weights. It covers single-pass prefill against token-by-token and chunked decoding, a cross-check of the layer structure against `candle_transformers::models::qwen3`, prefill at offsets across split boundaries, rollback to every boundary including `0`, the current length, and `len + 1`, fork isolation under truncation and append, decode after rollback against a fresh prefill of the accepted prefix with an audio-bearing prompt, both stop ids, and loader checks. `tests/qwen3_asr_decoder_reference.rs` is opt-in (`DEVL_QWEN3_ASR_CKPT`, `DEVL_QWEN3_ASR_WAV`, optional `DEVL_QWEN3_ASR_EXPECTED_IDS`).
+
+**Observed** (hardware: aarch64 Linux, Cortex-X925 and Cortex-A725, CPU only; `rustc 1.100.0`; `f32`; checkpoint revision and shard sha256 values from 6.1, verified; code commit `a37271a`). Command:
+
+```bash
+DEVL_QWEN3_ASR_CKPT=ckpt DEVL_QWEN3_ASR_WAV=clip.wav \
+  cargo test -p devl-candle --release --test qwen3_asr_decoder_reference -- --nocapture
+```
+
+The clip was derived from the 48 kHz 24-bit demo recording by a 3-sample box average to 16 kHz and 16-bit PCM, because no resampler was available. It is not the fixture of 6.13 and has no upstream reference ids, so these runs check behavior and not token parity.
+
+| Clip | Samples | Windows | Audio tokens | Generated ids | First ids | Last id | Max abs logit difference, rolled back vs fresh |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| first 5 s | 80000 | 1 | 65 | 23 | `11528 6364 151704` | `151645` | 2.3e-5 |
+| full clip | 240819 | 2 | 196 | 49 | `11528 6364 151704` | `151645` | 3.2e-5 |
+
+Rollback was checked after keeping 0, 1, about half, and all but one generated tokens, and the decoded next id after each rollback equaled the id from the uninterrupted run. The full-clip row uses windowed audio attention on the resampled clip, while the upstream run quoted in 6.7 used whole-clip attention on the exact fixture and produced 48 ids. The one-id difference is not analyzed and is not evidence either way. Token parity against upstream on the 6.13 fixtures is left to the parity issue.
