@@ -44,9 +44,8 @@
 //! are removed with `PriorityScheduler::cancel_stream`, the `DevlSession` is
 //! dropped (by the worker if one is mid-job), and only then does the stream
 //! leave the registry and its slot become reusable. A stream whose job is
-//! still executing keeps its slot until the worker retires it, so queued plus
-//! running jobs never exceed `max_streams` streams' worth (one draft and one
-//! commit each) regardless of open/cancel churn. Scheduler permits are RAII
+//! still holding its session keeps its slot until the worker retires it, so
+//! live sessions and queued work stay bounded during open/cancel churn. Scheduler permits are RAII
 //! and are released when each job finishes, including on panic. Scheduler
 //! per-stream metadata is dropped when the stream's last draft stops, so it
 //! does not grow with the number of completed streams. Pending `Partial`
@@ -141,7 +140,7 @@ pub struct CoordinatorStats {
     pub active_commits: usize,
     /// Executing draft jobs (held scheduler permits).
     pub active_drafts: usize,
-    /// Streams with retained scheduler cancellation metadata. Bounded by the
+    /// Distinct streams with executing drafts. Bounded by the
     /// concurrent draft limit, independent of completed streams.
     pub tracked_streams: usize,
 }

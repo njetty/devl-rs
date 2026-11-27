@@ -45,7 +45,7 @@ fn cancel_stream_preempts_running_draft_and_releases_metadata() {
     assert!(s.cancel_stream(StreamId(1)).is_empty());
     assert!(s.should_preempt_draft(StreamId(1), seq));
     assert!(!s.should_preempt_draft(StreamId(2), seq));
-    assert!(s.tracked_streams() > 0);
+    assert_eq!(s.tracked_streams(), 1);
     drop(job);
     assert_eq!(s.tracked_streams(), 0);
     assert_eq!(s.active_drafts(), 0);

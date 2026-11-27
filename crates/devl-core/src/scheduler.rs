@@ -267,11 +267,11 @@ impl<T: Send + 'static> PriorityScheduler<T> {
         removed
     }
 
-    /// Number of streams with retained cancellation metadata. Bounded by
-    /// `max_concurrent_drafts`; exposed for leak checks.
+    /// Number of distinct streams with executing drafts. Bounded by
+    /// `max_concurrent_drafts`; any cancellation markers are retained only for these streams.
     pub fn tracked_streams(&self) -> usize {
         let state = self.inner.state.lock().expect("scheduler mutex poisoned");
-        state.last_commit_seq.len() + state.active_draft_streams.len()
+        state.active_draft_streams.len()
     }
 
     /// Non-blocking dequeue of the highest-priority runnable job.
