@@ -250,7 +250,7 @@ prepared in the fixture directory at measurement time.
 
 - **Implemented:** `devl-core` (`DevlBackend` trait, `DevlSession` state machine, single-pass verify/rollback/resume loop, `PriorityScheduler` with step-level cooperative preemption, and deterministic `MockBackend` test suite) and the `devl` facade crate.
 - **Implemented:** Local Whisper inference over Candle, deterministic mel extraction, per-layer KV-cache truncation, and local streaming examples.
-- **Planned (`v0.2`):** Qwen3-ASR inference over Candle.
+- **In progress (`v0.2`):** Qwen3-ASR over Candle. The windowed audio encoder, decoder, and `DevlBackend` integration with reusable audio windows and prefix KV are implemented. Real-checkpoint parity validation is pending.
 - **Planned (`v0.2`):** `devl-server` transport layer (WebSocket/HTTP, stream multiplexing, and VAD/endpointing hooks).
 
 ## Contributing

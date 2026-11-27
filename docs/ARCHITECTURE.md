@@ -106,8 +106,14 @@ pub trait DevlBackend {
     /// so `rollback_kv(kv, accepted_len)` truncates to `P + accepted_len`.
     type KvCache;
 
-    /// End-of-sequence token ID for this model.
+    /// Canonical end-of-sequence token ID for this model.
     fn eos_token(&self) -> TokenId;
+
+    /// Whether `token` ends generation. Every stop decision in `devl-core` uses this
+    /// predicate. Default: `token == self.eos_token()`. Wrappers must forward it.
+    fn is_eos_token(&self, token: TokenId) -> bool {
+        token == self.eos_token()
+    }
 
     /// Expected mono PCM sample rate in Hz (default: 16,000 Hz).
     fn sample_rate_hz(&self) -> u32 {
@@ -173,6 +179,16 @@ pub trait DevlBackend {
     ) -> Result<StepOutput, Self::Error>;
 }
 ```
+
+### Stop Tokens (`is_eos_token`)
+
+Some checkpoints stop on more than one id (Qwen3-ASR: `<|im_end|>` and `<|endoftext|>`). `devl-core` therefore never compares a token with `eos_token()` directly. Draft acceptance, the resumed decode loop, reported EOS status (`reached_eos`, `draft_reached_eos`), and checkpoint promotion all call `DevlBackend::is_eos_token`.
+
+- Invariant: `is_eos_token(eos_token())` is `true`, and the answer depends only on the token, not on mutable state, so every pass over the same audio stops at the same position.
+- The generated id is kept as is. A session that stops on a non-canonical stop id returns that id and not `eos_token()`.
+- The default implementation keeps single-stop backends (`MockBackend`, `CandleWhisperBackend`) source compatible and behaviorally unchanged.
+- The blanket implementations for `&B` and `Arc<B>` forward the method. Any other wrapper must do the same, otherwise the wrapped backend silently falls back to the single-id default.
+- Covered by `crates/devl-core/tests/multi_stop.rs`.
 
 ### Why `verify_draft` Feeds `draft[..k.saturating_sub(1)]`
 
@@ -242,7 +258,7 @@ Following Algorithm 1 of arXiv:2611.20064:
 
 Both checkpoint drafts (`run_draft_cancellable`) and final commits (`commit`) execute the same core protocol in `devl-core`:
 
-Given audio encoding `encoding`, draft slice `d` (capped to `max_tokens`, length `k`), `eos = backend.eos_token()`, and optional preemption predicate `should_preempt`:
+Given audio encoding `encoding`, draft slice `d` (capped to `max_tokens`, length `k`), `is_eos(t) = backend.is_eos_token(t)`, and optional preemption predicate `should_preempt`:
 
 1. **Direct checkpoint promotion** (commit only, enabled via `SessionConfig::enable_checkpoint_promotion`):
    - If `latest_draft` exists, `draft_reached_eos` is `true`, and `draft_audio_len == audio_buffer.len()` (same complete audio with unchanged normalization), return `latest_draft` directly without re-running `verify_draft` (Algorithm 1, line 19).
@@ -260,9 +276,9 @@ Given audio encoding `encoding`, draft slice `d` (capped to `max_tokens`, length
    - Call `backend.rollback_kv(&mut kv, p.len() - 1)?`.
    - `kv` now holds `prompt` plus `p[..p.len() - 1]`. The final element `p[p.len() - 1]` is not yet in `kv` and acts as the seed token.
 6. **Optional repair rounds** (post-v0.1 extension, Algorithm 1 line 8):
-   - If `a < k` and `p.last() != Some(&eos)`, the unverified suffix of `d` may be realigned after `p` and verified again (capped at 3 rounds), preserving the cache convention at step 5.
+   - If `a < k` and `p.last()` is not a stop token, the unverified suffix of `d` may be realigned after `p` and verified again (capped at 3 rounds), preserving the cache convention at step 5.
 7. **Resumed greedy decoding**:
-   - While `p.last() != Some(&eos)` and `p.len() < config.max_tokens`:
+   - While `p.last()` is not a stop token and `p.len() < config.max_tokens`:
      - If `should_preempt()` returns `true` (checkpoint drafts only; never set on commits), stop early and return `Preempted(p)`.
      - `let seed = *p.last().unwrap();`
      - `let step = backend.decode_step(&encoding, &mut kv, seed)?;`
@@ -349,10 +365,10 @@ Per Section 2 (item 4) and Section 3 of arXiv:2611.20064v1, TTFS is minimized un
   - **`decode_step`**:
     - Feeds a single `[1, 1]` token tensor with positional embedding sliced at offset `pos = seq_len` (`positional_embedding.narrow(0, pos, 1)`), appends its `(k, v)` slice to each layer's self-attention cache, attends over `0..=pos` with no causal mask needed, and returns the next greedy argmax token.
 
-### Qwen3-ASR (Planned for v0.2)
+### Qwen3-ASR (`Qwen3AsrBackend`)
 
-- **Contract**: the pinned checkpoint, upstream evidence, reference procedure, reuse and invalidation rules, operation mapping, and open API decisions are specified in [Section 6](#6-qwen3-asr-compatibility-contract-v020). This subsection is a summary; Section 6 takes precedence.
-- **Upstream status**: `candle-transformers 0.11.1` includes `qwen3` / `qwen3_vl` text/vision models but does not yet provide a `qwen3_asr` module; v0.2 will implement the windowed audio encoder and Qwen3 decoder KV-cache wrapper directly over `candle-core` and `candle-nn`.
+- **Contract**: the pinned checkpoint, upstream evidence, reference procedure, reuse and invalidation rules, operation mapping, and API decisions are specified in [Section 6](#6-qwen3-asr-compatibility-contract-v020). This subsection is a summary; Section 6 takes precedence. The backend is implemented as `Qwen3AsrBackend` ([6.15](#615-devlbackend-integration-implemented)).
+- **Upstream status**: `candle-transformers 0.11.1` includes `qwen3` / `qwen3_vl` text/vision models but does not yet provide a `qwen3_asr` module, so the windowed audio encoder and the Qwen3 decoder KV-cache wrapper are implemented directly over `candle-core` and `candle-nn`.
 - **Encoder behavior (fixed windows)**:
   - Per Table 1 of arXiv:2611.20064v1, Qwen3-ASR encodes fixed non-overlapping audio windows from stream start and prefills completed blocks into the LLM decoder KV cache once during speech.
   - `encode_audio(pcm, prior_encoding)` reuses cached audio blocks and their prefilled prefix KV state from `prior_encoding` when normalization is unchanged, encoding only newly completed blocks and recording the tail; if normalization changed, cached blocks are invalidated and rebuilt from the prompt prefix.
@@ -364,7 +380,7 @@ Per Section 2 (item 4) and Section 3 of arXiv:2611.20064v1, TTFS is minimized un
 
 ## 6. Qwen3-ASR Compatibility Contract (v0.2.0)
 
-This section fixes the model and offline reference contract for the planned Qwen3-ASR backend in `devl-candle`. Subsections 6.1 to 6.12 are a specification. 6.13 and 6.14 describe the implemented audio path and decoder. No trait change is made by any of it.
+This section fixes the model and offline reference contract for the planned Qwen3-ASR backend in `devl-candle`. Subsections 6.1 to 6.12 are a specification. 6.13 to 6.15 describe the implemented audio path, decoder, and backend. The only trait change is the defaulted `is_eos_token` method (D1, 6.15).
 
 Conventions used below:
 
@@ -613,7 +629,7 @@ Exactness notes:
 
 | Operation | Qwen3-ASR behavior (Design) | Existing contract it must satisfy |
 | --- | --- | --- |
-| `eos_token()` | Returns `151645`. See D1 for the second stop id `151643`. | Single `TokenId`. |
+| `eos_token()` | Returns `151645`. `is_eos_token` accepts `151645` and `151643` (D1, resolved in 6.15). | Single canonical `TokenId` plus the defaulted predicate. |
 | `sample_rate_hz()` | `16_000`, the trait default. | Default method. |
 | `new_kv_cache()` | Empty decoder cache, no prompt, `prompt_len = 0`. Cannot see the encoding. | `&self`, `Result`. |
 | `encode_audio(pcm, prior)` | Algorithm in 6.8. Returns the new encoding, sharing reusable blocks with `prior`. Runs the audio tower and any new prefix prefill. | `prior_encoding: Option<&AudioEncoding>`, deterministic function of `pcm`. Whole-buffer input from stream start. |
@@ -633,11 +649,11 @@ Protocol-level mapping:
 
 None of these is implemented here. Each must be settled in the issue that needs it. Items marked "trait" would change `devl-core`, which this milestone's issue #22 does not authorize.
 
-- **D1, second stop token (trait).** The model stops on `151645` or `151643`. `DevlBackend::eos_token()` returns one id and `devl-core` compares with `==` (`session.rs` lines 397, 419, 441, 452). If the model ever emits `151643`, the session would not stop where upstream does. Options: (a) extend the trait with an EOS predicate or id set, defaulting to `token == eos_token()`; (b) keep one id and treat `151643` as unsupported, verifying on fixtures that it is not emitted. Recommendation: (b) for the first parity issue with an assertion in the reference tooling that generated ids contain no `151643`, including at the final position, and (a) if any fixture violates it.
+- **D1, second stop token (trait). Resolved in 6.15 with option (a).** The model stops on `151645` or `151643`. `DevlBackend::eos_token()` returns one id and `devl-core` compares with `==` (`session.rs` lines 397, 419, 441, 452). If the model ever emits `151643`, the session would not stop where upstream does. Options: (a) extend the trait with an EOS predicate or id set, defaulting to `token == eos_token()`; (b) keep one id and treat `151643` as unsupported, verifying on fixtures that it is not emitted. Recommendation: (b) for the first parity issue with an assertion in the reference tooling that generated ids contain no `151643`, including at the final position, and (a) if any fixture violates it.
 - **D2, forced language (no trait change).** Language mode is fixed per backend instance or session and changes the prompt (and therefore `P`). It belongs in backend construction options. Changing it invalidates every cached block. Tokenizing `language <Name><asr_text>` for 30 names needs either the Qwen2 byte-level BPE (vocab, merges, and the regex fix noted in 6.5) or a verified id table. Decide which in the loader issue.
-- **D3, prior encoding validation (no trait change).** The trait accepts any `&AudioEncoding` as prior. The backend must store and check fingerprints (6.8). Decide the fingerprint (full compare of retained samples versus a hash).
-- **D4, supported duration bounds (no trait change).** Minimum 8000 samples (pad) and maximum 1200 s (`MAX_ASR_INPUT_SECONDS`) match upstream. At 13 tokens per second, 1200 s is 15600 audio tokens in one prefill. Decide whether v0.2.0 enforces a smaller cap and which `Error` variant reports it.
-- **D5, cached-state ownership (no trait change).** `AudioEncoding` will hold reference-counted per-block K/V. `new_kv_cache()` takes no encoding, so `verify_draft` performs the seeding. Confirm that `AudioEncoding: Send` (and `Sync` where `PriorityScheduler` shares it) holds for Candle tensors on all supported devices before choosing the representation.
+- **D3, prior encoding validation (no trait change). Resolved in 6.15.** The trait accepts any `&AudioEncoding` as prior. The backend must store and check fingerprints (6.8). Decide the fingerprint (full compare of retained samples versus a hash).
+- **D4, supported duration bounds (no trait change). Resolved in 6.15.** Minimum 8000 samples (pad) and maximum 1200 s (`MAX_ASR_INPUT_SECONDS`) match upstream. At 13 tokens per second, 1200 s is 15600 audio tokens in one prefill. Decide whether v0.2.0 enforces a smaller cap and which `Error` variant reports it.
+- **D5, cached-state ownership (no trait change). Resolved in 6.15.** `AudioEncoding` will hold reference-counted per-block K/V. `new_kv_cache()` takes no encoding, so `verify_draft` performs the seeding. Confirm that `AudioEncoding: Send` (and `Sync` where `PriorityScheduler` shares it) holds for Candle tensors on all supported devices before choosing the representation.
 - **D6, pre-emption granularity (no trait change, scheduler note).** `encode_audio` and `verify_draft` run before the first `should_preempt` check (Section 4). With a reusable prefix, encoder and prefix prefill work scales with uncached blocks. Whole-buffer mel and cache validation still scale with clip length, and invalidation can require rebuilding the entire prefix. No change is proposed, but checkpoint cadence should be documented in the server issue.
 - **D7, frontend reuse (no trait change).** The existing `mel.rs` pads to 30 s and supports 80 or 128 bins. Qwen3 needs a variable-length 128-bin frontend with the global-floor semantics of 6.3. Whether `candle_transformers` `pcm_to_mel` can be made to match without padding is unverified (see 6.12).
 
@@ -785,7 +801,7 @@ Behavior:
 - Positions: rotate-half 1-D RoPE at absolute positions. The position of a fed token is the cache length at that moment, so rollback needs no offset state (6.6). Cos and sin are computed per call for `len..len + n`, with no limit other than `max_position_embeddings`.
 - Cache: `Qwen3AsrKvCache` holds post-RoPE keys and values per layer. `fork` shares tensors, appends allocate new tensors, and `truncate(n)` narrows a view, so forks never observe each other. `truncate` rejects `n > len` with `InvalidCacheLength` and leaves the cache unchanged. A forward pass updates the cache only after every layer succeeds. The decoder does not know the prompt length, so callers truncate to `P + n`.
 - API: `embed_prompt` splices audio embeddings into the prompt at `<|audio_pad|>` positions, `extend` appends without logits, `prefill(embeds, cache, logit_rows)` returns `f32` logits for the last rows only, `step` and `step_logits` feed one token, and `argmax_rows` selects greedily with ties to the lowest id and an error on NaN. No logit suppression applies.
-- Stop ids: `STOP_TOKEN_IDS` lists both upstream ids, `151645` and `151643`, and `is_stop_token` tests either. The decoder never maps or rewrites ids. Reducing them to the single `DevlBackend::eos_token` is decision D1 and belongs to backend integration.
+- Stop ids: `STOP_TOKEN_IDS` lists both upstream ids, `151645` and `151643`, and `is_stop_token` tests either. The decoder never maps or rewrites ids. `Qwen3AsrBackend` maps them onto the backend predicate (6.15).
 - Loader: `Qwen3AsrDecoder::from_checkpoint_dir` requires both pinned shard names and byte sizes and a `text_config` equal to the pinned one, then reads only `thinker.model.*` and `thinker.lm_head.*`. It never reads the audio tower. The shared reader also checks that every indexed tensor exists in its shard. Shard sizes are a guard, not a hash. Verify the sha256 values in 6.1 outside the process.
 - Dtype: only `f32` is exercised, as in 6.13.
 - Attention mode: the decoder is agnostic to how audio embeddings were made. Synthetic tests use text tokens and random embeddings. The real-checkpoint run uses this crate's block-windowed encoder. For a clip of at most one 8 s block that equals the upstream default whole-clip attention (6.4, 6.13), so only such a clip is decoder-equivalent to the default upstream reference. Longer clips differ between the two audio attention modes and must be compared against the matching reference from 6.13.
@@ -808,3 +824,42 @@ The clip was derived from the 48 kHz 24-bit demo recording by a 3-sample box ave
 | full clip | 240819 | 2 | 196 | 49 | `11528 6364 151704` | `151645` | 3.2e-5 |
 
 Rollback was checked after keeping 0, 1, about half, and all but one generated tokens, and the decoded next id after each rollback equaled the id from the uninterrupted run. The full-clip row uses windowed audio attention on the resampled clip, while the upstream run quoted in 6.7 used whole-clip attention on the exact fixture and produced 48 ids. The one-id difference is not analyzed and is not evidence either way. Token parity against upstream on the 6.13 fixtures is left to the parity issue.
+
+### 6.15 `DevlBackend` Integration (Implemented)
+
+Implemented in `crates/devl-candle/src/qwen3_asr/backend.rs` as `Qwen3AsrBackend`, available through `devl::candle::qwen3_asr` with the `candle` feature. The default facade build without Candle is unchanged, and `devl-core` gained no dependency. Verification, prefix matching, rollback selection, and scheduling remain in `devl-core`.
+
+**Decisions.**
+
+- **D1 (stop ids).** The trait gained `is_eos_token(&self, token) -> bool`, defaulting to `token == eos_token()` (see Section 2, Stop Tokens). `Qwen3AsrBackend` reports `151645` as `eos_token()` and accepts both `151645` and `151643`. Option (b) was rejected because it would silently mis-stop on a checkpoint that emits `151643`. All four `==` comparisons in `session.rs` and both forwarding implementations were converted. `MockBackend` and `CandleWhisperBackend` use the default.
+- **D3 (prior validation).** An encoding carries a backend instance id and the retained samples that determine its final windows. Reuse requires the same instance and a bitwise sample match, so an unrelated, shortened, or edited prior is never trusted, and a foreign prior rebuilds instead of erroring. A foreign encoding passed to `verify_draft` or `decode_step` returns `StateMismatch`. An exact comparison was chosen over a hash so that a collision cannot cause a stale reuse. It costs `4 * S` bytes per encoding and a linear scan.
+- **D4 (input bound).** See below.
+- **D5 (ownership).** The encoding holds one `Qwen3AsrKvCache` covering the prompt prefix and every final window, plus the tail embeddings. The cache at any earlier window boundary is a truncation of it, so no per-window snapshot is stored. `Qwen3AsrAudioEncoding`, `Qwen3AsrDecodeState`, and the backend are `Send + Sync` (asserted in tests).
+- **D2 (forced language)** stays open. The default prompt has an empty context and no forced language. The prompt token ids are configuration, so a forced-language prompt is a backend option for a later issue.
+
+**Final windows and cached state.** An encoding built from `S` samples (after the short-clip pad) holds a cache for window `k` only when `S >= 160 * (W * k + W - 1) + 200` with `W = 800` frames (`samples_to_finalize_frame`). For the pinned checkpoint window `0` is final from 128040 samples. The window after the last final one, and any non-final window, is encoded on every call and never cached (at most one window, so at most 104 tokens). The prompt suffix and the draft are recomputed in every `verify_draft`.
+
+**`encode_audio(pcm, prior)`.** Validates and pads the input, computes the mel for the whole buffer, and takes over the longest reusable prefix of the prior's final windows. A window is reusable only when every earlier window is, the samples that determine it are bit-identical, and either the clamp floor is unchanged or the window's raw minimum is at least both the stored and the new floor (the clamp is inactive under both, so its features are identical). Windows after the first non-reusable one are encoded and prefilled one window at a time on top of the truncated prior cache, or on a fresh prefix prefill when none is reusable. `Qwen3AsrEncodeStats` on the encoding reports reused, encoded, and tail windows and the prefilled prefix tokens.
+
+**`verify_draft`.** Forks the cached prefix, then prefills `[tail embeddings, suffix, draft[..k - 1]]` in one causal pass and requests the last `max(k, 1)` logit rows, so position `0` is predicted from the end of the prompt and position `i` after `draft[i - 1]`. `P = prefix + N + suffix` is recorded in the state. The call replaces the state it is given and leaves it untouched on error. `rollback_kv(kv, n)` truncates to `P + n`, which never reaches the shared prefix. It rejects a state that was never prefilled and any `n` beyond the cached generated tokens. `decode_step` appends one token at position `kv.len()` and checks that the state and encoding agree on `P`.
+
+**Input bound and memory (D4).** `Qwen3AsrBackendConfig::max_audio_samples` defaults to 120 s (1920000 samples) and may be raised to the frontend limit of 1200 s. Longer input fails with `AudioTooLong` carrying the configured cap. The figures below are derived from shapes, not measured: the pinned decoder caches `2 * 28 * 8 * 128 = 57344` values per token (224 KiB in `f32`) and the audio yields 13 tokens per second, so 120 s is about 1.6 thousand tokens and about 0.35 GiB of `f32` cache per copy, and 1200 s is 15600 tokens and about 3.5 GiB per copy. Appending allocates new tensors, so budget roughly three copies at peak (the encoding, an extension in flight, one verification pass). Prefix prefill runs one 104-token window at a time, which keeps attention scores at `heads x 104 x length` instead of `heads x length x length`. Per-call cost still includes a whole-buffer mel and sample comparison (D6). The cap is a safety bound, not a validated long-context limit: only the clip lengths in the observed table below were run on the real checkpoint.
+
+**Numerical caveat.** Prefix KV is produced by prefilling the prompt in pieces (prefix, then one window at a time) and the remainder in another call, so it is not bitwise equal to a single whole-prompt prefill. The synthetic tests bound the difference in logits and require equal tokens. The reuse path itself is bitwise equal to a fresh encode of the same audio, because it executes the same operations on the same shapes.
+
+**Tests.** `crates/devl-candle/tests/qwen3_asr_backend.rs` runs in CI with synthetic weights and a 40-frame window (8 tokens), using the real frontend. It covers: verification logits and offsets against a whole-prompt prefill for clips on both sides of the finality boundary and for empty and nonempty drafts; reuse when audio grows with an unchanged floor; a changed floor with an inactive clamp (reused, exact) and with an active clamp (rebuilt); altered samples inside each window; shorter, unrelated, and foreign priors; prior immutability and fork isolation; rollback to every valid length followed by resumed decode against offline greedy; both stop ids through `DevlSession` with and without promotion; session runs over growing audio against offline greedy; and error paths (empty, non-finite, out-of-range, too long, bad draft id, mismatched state, position limit, invalid configuration). `crates/devl-core/tests/multi_stop.rs` covers the predicate in the core loop and wrappers. Disabling the floor check or the sample comparison makes the corresponding tests fail. `tests/qwen3_asr_backend_reference.rs` is an opt-in smoke test (`DEVL_QWEN3_ASR_CKPT`, `DEVL_QWEN3_ASR_WAV`) that checks session output against the backend's own offline decode and window reuse on a real clip. It is not an upstream parity test, which is left to the parity issue.
+
+
+**Observed** (hardware: aarch64 Linux, Cortex-X925 and Cortex-A725 cores, CPU only; `rustc 1.100.0`; `f32`; checkpoint revision and shard sha256 values from 6.1, verified; code commit `22c2363`). Command:
+
+```bash
+DEVL_QWEN3_ASR_CKPT=ckpt DEVL_QWEN3_ASR_WAV=clip.wav \
+  cargo test -p devl-candle --release --test qwen3_asr_backend_reference -- --nocapture
+```
+
+| Clip | Samples | Audio tokens | Final windows | Drafts before commit | Committed ids | Result |
+| --- | --- | --- | --- | --- | --- | --- |
+| 15 s English clip, 3-sample box average to 16 kHz (as in 6.14) | 240819 | 196 | 1 | 8 | 49, ending in `151645` | equals offline greedy with and without promotion, windows reused |
+| 36 s concatenation, local copy of the `long36s` clip of 6.13 | 581640 | 473 | 4 | 19 | 113 | equals offline greedy with and without promotion, windows reused |
+
+Drafts are taken every 2 s of buffered audio, so later drafts verify the previous draft against a new encoding with reused windows and prefix KV. The comparison is the backend against itself (session protocol versus offline greedy decode of the whole clip), run with block-windowed audio attention. It is not parity with upstream token ids, which is left to the parity issue. Wall-clock times were not recorded because other builds shared the machine. Neither clip exceeds 36 s, so nothing in this table supports behavior near the 120 s default cap or the 1200 s frontend limit. The first clip is the one used in 6.14. The local `long36s` copy was not checked against the sha256 of the 6.13 fixture.
