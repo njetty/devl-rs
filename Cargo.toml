@@ -7,14 +7,14 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/njetty/devl-rs"
 
 [workspace.dependencies]
-devl-core = { version = "0.1.0-alpha.1", path = "crates/devl-core" }
-devl-candle = { version = "0.1.0-alpha.1", path = "crates/devl-candle" }
+devl-core = { version = "0.1.0", path = "crates/devl-core" }
+devl-candle = { version = "0.1.0", path = "crates/devl-candle" }
 thiserror = "2.0"
 candle-core = "0.11"
 candle-nn = "0.11"

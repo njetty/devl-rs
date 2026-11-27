@@ -7,7 +7,7 @@
 
 An independent, unofficial Rust implementation of **DEVL: Decode Early, Verify Late** by Doyeob Kim ([arXiv:2611.20064](https://arxiv.org/abs/2611.20064)). This project has no affiliation with, and is not endorsed by, the paper author or Nari Labs.
 
-Offline speech recognition models typically achieve lower error rates than streaming-trained models, but running them only after turn end places the entire decode time on the critical path before a response can begin. `devl-rs` bridges this gap by running periodic speculative drafts over incoming audio and verifying the latest draft against the complete utterance in a single parallel forward pass at commit time, preserving exact greedy offline output while reducing time-to-final-segment (TTFS).
+Offline speech recognition models typically achieve lower error rates than streaming-trained models, but running them only after turn end places the entire decode time on the critical path before a response can begin. `devl-rs` bridges this gap by running periodic speculative drafts over incoming audio and verifying the latest draft against the complete utterance in a single parallel forward pass at commit time to reduce time-to-final-segment (TTFS). With equivalent deterministic inference, the final tokens match offline greedy decoding.
 
 ## Workspace Architecture
 
@@ -20,8 +20,8 @@ Offline speech recognition models typically achieve lower error rates than strea
                          v               v (optional: candle / metal / cuda)
           +-------------------+     +-------------------+
           |     devl-core     | <-- |    devl-candle    |
-          | (trait, session,  |     | (Candle Whisper / |
-          |  scheduler, mock) |     |  Qwen3-ASR impl)  |
+          | (trait, session,  |     | (Candle Whisper   |
+          |  scheduler, mock) |     |  backend)         |
           +-------------------+     +-------------------+
 ```
 
@@ -29,9 +29,9 @@ Offline speech recognition models typically achieve lower error rates than strea
 | :--- | :--- | :--- |
 | `devl` | Top-level facade re-exporting `devl-core` (`devl::*`, `devl::core`) and optional backends (`devl::candle`). | `candle`, `metal`, `cuda`, `test-utils` |
 | `devl-core` | Runtime- and transport-agnostic core crate (zero ML or networking dependencies). Owns `DevlBackend`, `DevlSession`, single-pass verification and KV rollback, `PriorityScheduler`, and `MockBackend`. | `test-utils` |
-| `devl-candle` | Local inference backend over `candle-core`, `candle-nn`, and `candle-transformers` for Whisper and Qwen3-ASR. | `metal`, `cuda` |
+| `devl-candle` | Local inference backend over `candle-core`, `candle-nn`, and `candle-transformers` for Whisper. | `metal`, `cuda` |
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for trait signatures, exactness invariants, session states, and scheduler preemption rules, and [docs/ROADMAP.md](docs/ROADMAP.md) for the multi-release plan.
+See [docs/ARCHITECTURE.md](https://github.com/njetty/devl-rs/blob/main/docs/ARCHITECTURE.md) for trait signatures, exactness invariants, session states, and scheduler preemption rules, and [docs/ROADMAP.md](https://github.com/njetty/devl-rs/blob/main/docs/ROADMAP.md) for the multi-release plan.
 
 ## Usage
 
@@ -40,13 +40,25 @@ Depend on the top-level `devl` facade crate (optionally enabling `candle`, `meta
 ```toml
 # Facade crate (core only by default)
 [dependencies]
-devl = "0.1.0-alpha.1"
+devl = "0.1.0"
 
 # Facade crate with Candle backend (or features = ["metal"] / ["cuda"])
-# devl = { version = "0.1.0-alpha.1", features = ["candle"] }
+# devl = { version = "0.1.0", features = ["candle"] }
 
 # Core protocol only (zero ML dependencies)
-# devl-core = "0.1.0-alpha.1"
+# devl-core = "0.1.0"
+```
+
+On ARM64 Linux, add the following to your application's workspace root
+`Cargo.toml` if you enable Candle. It avoids an upstream FP16 assembly build
+error in unoptimized dev builds.
+
+```toml
+[profile.dev.package.gemm-f16]
+opt-level = 3
+
+[profile.dev.package.gemm-common]
+opt-level = 3
 ```
 
 ## Local Whisper examples
@@ -121,11 +133,10 @@ cargo check -p devl --features candle
 # Inspect crates.io package contents
 cargo package --list -p devl
 cargo package --list -p devl-core
+cargo package --list -p devl-candle
 ```
 
 ## Status
-
-Status: `v0.1-alpha` in active development.
 
 - **Implemented:** `devl-core` (`DevlBackend` trait, `DevlSession` state machine, single-pass verify/rollback/resume loop, `PriorityScheduler` with step-level cooperative preemption, and deterministic `MockBackend` test suite) and the `devl` facade crate.
 - **Implemented:** Local Whisper inference over Candle, deterministic mel extraction, per-layer KV-cache truncation, and local streaming examples.
@@ -134,7 +145,7 @@ Status: `v0.1-alpha` in active development.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, local verification, pull request rules, and signed-commit requirements. Contributors and coding agents must also follow [AGENTS.md](AGENTS.md) for workspace boundaries, issue execution workflow, and clean-room documentation rules.
+See [CONTRIBUTING.md](https://github.com/njetty/devl-rs/blob/main/CONTRIBUTING.md) for setup, local verification, pull request rules, and signed-commit requirements. Contributors and coding agents must also follow [AGENTS.md](https://github.com/njetty/devl-rs/blob/main/AGENTS.md) for workspace boundaries, issue execution workflow, and clean-room documentation rules.
 
 ## License
 

@@ -19,8 +19,8 @@ DEVL converts offline speech recognition models into low-latency streaming recog
                          v               v (optional: candle / metal / cuda)
           +-------------------+     +-------------------+        +-------------------+
           |     devl-core     | <-- |    devl-candle    | <----- | devl-server (v0.2)|
-          | (protocol, state, |     | (Candle Whisper / |        | (transport, VAD,  |
-          |  scheduler, mock) |     |  Qwen3-ASR impl)  |        |  HTTP/WS/gRPC)    |
+          | (protocol, state, |     | (Candle Whisper   |        | (transport, VAD,  |
+          |  scheduler, mock) |     |  backend)         |        |  HTTP/WS/gRPC)    |
           +-------------------+     +-------------------+        +-------------------+
 ```
 
@@ -38,7 +38,7 @@ DEVL converts offline speech recognition models into low-latency streaming recog
   - Owns the `DevlBackend` trait, core token/verification types, `DevlSession` state machine, exact verification/rollback/resume protocol (used for both checkpoints and final commits), `PriorityScheduler`, and a deterministic `MockBackend` (compiled under `#[cfg(any(test, feature = "test-utils"))]`, gated by feature `test-utils`).
 - **`crates/devl-candle`**:
   - Depends on `devl-core`, `candle-core`, `candle-nn`, and `candle-transformers`, with optional `metal` and `cuda` feature flags.
-  - Owns model loading, deterministic audio feature extraction, device placement, KV-cache management/truncation, and `DevlBackend` implementations for local models (Whisper and Qwen3-ASR).
+  - Owns model loading, deterministic audio feature extraction, device placement, KV-cache management/truncation, and the `DevlBackend` implementation for local Whisper inference.
   - Must not re-implement prefix verification, rollback selection, draft loop orchestration, or commit-over-draft scheduling; all protocol logic lives in `devl-core`.
 - **`crates/devl-server`** (planned for v0.2; not scaffolded in v0.1):
   - Will own network transport, connection/stream multiplexing, VAD/endpointing hooks, and telemetry, bridging client streams to `devl-core` and a chosen backend crate.
@@ -300,11 +300,11 @@ Per Section 2 (item 4) and Section 3 of arXiv:2611.20064v1, TTFS is minimized un
 ```text
   Stream Submissions
     |
-    +---> Commit jobs (Priority::Commit) ----> [ High-Priority FIFO Queue ] ---+
-    |                                                                          |---> Worker Pool
-    +---> Draft jobs  (Priority::Draft)  ----> [ Low-Priority FIFO Queue  ] ---+     (pop Commit first;
+    +---> Commit jobs (JobPriority::Commit) ----> [ High-Priority FIFO Queue ] ---+
+    |                                                                             |---> Worker Pool
+    +---> Draft jobs  (JobPriority::Draft)  ----> [ Low-Priority FIFO Queue  ] ---+     (pop Commit first;
                                                  (coalesced per StreamId,             pop Draft only if
-                                                  bounded by max_active_drafts)       Commit empty)
+                                                  limited by draft slots)              Commit empty)
 ```
 
 ### Scheduling & Preemption Rules
@@ -317,9 +317,9 @@ Per Section 2 (item 4) and Section 3 of arXiv:2611.20064v1, TTFS is minimized un
    - Submitting a `Commit` for `StreamId` immediately evicts any queued `Draft` for that same stream and marks any currently executing `Draft` for that stream as cancelled.
 3. **Cooperative step-level preemption**:
    - GPU forward steps are atomic; a running draft cannot be killed mid-kernel.
-   - The scheduler maintains an atomic count of pending commits (`pending_commits: AtomicUsize`) and tracks cancelled stream IDs, exposing `should_preempt_draft(&self, stream_id: StreamId) -> bool`.
-   - Because `devl-core` drives the checkpoint `decode_step` loop directly, it evaluates `should_preempt_draft(stream_id)` before every token step. If any `Commit` job arrives in the queue (or the draft's own stream commits), the draft yields after the current step, releasing the worker slot to the commit job.
-   - Thus a background checkpoint delays a pending commit by at most one running decode step. Commits are never preempted by drafts and execute in FIFO order relative to other commits.
+   - The scheduler maintains an atomic count of pending commits (`pending_commits: AtomicUsize`) and tracks cancelled stream IDs, exposing `should_preempt_draft(&self, stream_id: StreamId, draft_seq: u64) -> bool`.
+   - Workers can pass `should_preempt_draft(stream_id, draft_seq)` to `run_draft_cancellable`, which invokes it before each autoregressive decode step. The check requests preemption while a commit is queued or when the draft's stream has received a newer commit.
+   - Encoding and verification run before the first preemption check. During autoregressive decoding, a draft can yield between token steps. Commits are dequeued in FIFO order and do not run the preemption check.
 4. **RAII slot accounting & shutdown**:
    - Dequeuing a job returns a `ScheduledJob` paired with a `JobPermit` whose `Drop` implementation decrements `active_drafts` / `active_commits` and wakes waiting workers via `Condvar`.
    - `shutdown()` wakes all blocked `next_job()` callers once queues drain (or immediately when empty).
@@ -336,7 +336,7 @@ Per Section 2 (item 4) and Section 3 of arXiv:2611.20064v1, TTFS is minimized un
   - Per Table 1 of arXiv:2611.20064v1, Whisper's encoder attends over the full utterance window. `encode_audio(pcm, _prior_encoding)` ignores `prior_encoding`, deterministically computes the log-mel spectrogram via `candle_transformers::models::whisper::audio::pcm_to_mel` (80 bins for v1/v2, 128 bins for v3/v3-turbo; padded to `N_FRAMES = 3000` / 30 s), and runs the Whisper audio encoder to produce `WhisperAudioEncoding { encoder_hidden_states: Tensor }`.
 - **Decoder & KV-cache truncation (verified against `candle-transformers 0.11.1`)**:
   - In `candle-transformers 0.11.1`, stock `models::whisper::model::TextDecoder` only caches cross-attention KV (`xa.is_some()`), recomputes self-attention over the entire prefix on every step, and requires `&mut self` (storing mutable cache state directly inside attention blocks).
-  - Consequently, `devl-candle` will implement a stateless (`&self`, `Send + Sync`) Whisper `AudioEncoder` and `TextDecoder` loaded from the standard Hugging Face `VarBuilder` paths (`model.encoder.*` and `model.decoder.*`), taking an explicit `&mut WhisperKvCache` per call so `Arc<CandleWhisperBackend>` can be shared across `PriorityScheduler` worker threads without locking model weights.
+  - Consequently, `devl-candle` implements a stateless (`&self`, `Send + Sync`) Whisper `AudioEncoder` and `TextDecoder` loaded from the standard Hugging Face `VarBuilder` paths (`model.encoder.*` and `model.decoder.*`), taking an explicit `&mut WhisperKvCache` per call so `Arc<CandleWhisperBackend>` can be shared across `PriorityScheduler` worker threads without locking model weights.
   - `WhisperKvCache` holds:
     - `prompt_len: usize` (the SOT/language/task/no-timestamps prefix length).
     - Per-layer self-attention `(k, v)` tensors (`[1, n_head, seq_len, head_dim]`) and cross-attention `(k, v)` tensors computed once from `encoder_hidden_states`.
@@ -349,9 +349,9 @@ Per Section 2 (item 4) and Section 3 of arXiv:2611.20064v1, TTFS is minimized un
   - **`decode_step`**:
     - Feeds a single `[1, 1]` token tensor with positional embedding sliced at offset `pos = seq_len` (`positional_embedding.narrow(0, pos, 1)`), appends its `(k, v)` slice to each layer's self-attention cache, attends over `0..=pos` with no causal mask needed, and returns the next greedy argmax token.
 
-### Qwen3-ASR (Planned Phase 3 Extension)
+### Qwen3-ASR (Planned for v0.2)
 
-- **Upstream status**: `candle-transformers 0.11.1` includes `qwen3` / `qwen3_vl` text/vision models but does not yet provide a `qwen3_asr` module; Phase 3 will implement the windowed audio encoder and Qwen3 decoder KV-cache wrapper directly over `candle-core` and `candle-nn`.
+- **Upstream status**: `candle-transformers 0.11.1` includes `qwen3` / `qwen3_vl` text/vision models but does not yet provide a `qwen3_asr` module; v0.2 will implement the windowed audio encoder and Qwen3 decoder KV-cache wrapper directly over `candle-core` and `candle-nn`.
 - **Encoder behavior (fixed windows)**:
   - Per Table 1 of arXiv:2611.20064v1, Qwen3-ASR encodes fixed non-overlapping audio windows from stream start and prefills completed blocks into the LLM decoder KV cache once during speech.
   - `encode_audio(pcm, prior_encoding)` reuses cached audio blocks and their prefilled prefix KV state from `prior_encoding` when normalization is unchanged, encoding only newly completed blocks and recording the tail; if normalization changed, cached blocks are invalidated and rebuilt from the prompt prefix.
