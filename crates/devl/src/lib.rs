@@ -9,11 +9,18 @@
 //! - `test-utils`: enables `devl_core::mock` (`MockBackend`) for deterministic testing.
 //!
 //! ```rust
-//! use devl::{DevlBackend, DevlSession, SessionConfig, SessionState};
+//! use devl::{CommitResult, DevlBackend, DevlError, DevlSession, SessionConfig};
 //!
-//! fn check_session_type<B: DevlBackend>(backend: B) {
-//!     let session = DevlSession::new(backend, SessionConfig::default()).unwrap();
-//!     assert_eq!(session.state(), SessionState::Idle);
+//! fn decode<B: DevlBackend>(
+//!     backend: B,
+//!     first_chunk: &[f32],
+//!     last_chunk: &[f32],
+//! ) -> Result<CommitResult, DevlError<B::Error>> {
+//!     let mut session = DevlSession::new(backend, SessionConfig::default())?;
+//!     session.push_audio(first_chunk)?;
+//!     let _draft = session.run_draft()?;
+//!     session.push_audio(last_chunk)?;
+//!     session.commit().cloned()
 //! }
 //! ```
 

@@ -30,15 +30,17 @@ pub use whisper::{AudioEncoder, TextDecoder, WhisperModel};
 pub struct CandleWhisperConfig {
     /// Target Candle execution device (CPU, Metal, or CUDA).
     pub device: Device,
-    /// Optional Whisper architecture hyperparameters from `candle-transformers`.
+    /// Whisper architecture hyperparameters from `candle-transformers`.
+    /// Set this before calling [`CandleWhisperBackend::from_var_builder`].
     pub model_config: Option<WhisperModelConfig>,
     /// Optional validated Whisper mel filter bank (`80` bins for v1/v2, `128` for v3/v3-turbo).
     pub mel_filters: Option<MelFilterBank>,
     /// Whisper EOS (`<|endoftext|>`) token ID.
     pub eos_token: TokenId,
-    /// Expected mono PCM input sample rate in Hz (16,000 Hz for Whisper).
+    /// Sample rate reported by [`DevlBackend::sample_rate_hz`].
+    /// Use 16,000 Hz PCM for the Whisper frontend, which performs no resampling.
     pub sample_rate_hz: u32,
-    /// Decoder prompt token prefix (e.g., SOT, language, task, notimestamps).
+    /// Nonempty decoder prompt token prefix (e.g., SOT, language, task, notimestamps).
     pub prompt_tokens: Vec<TokenId>,
     /// Whether to materialize per-position logits on host for diagnostics.
     pub return_logits: bool,
@@ -204,6 +206,11 @@ impl CandleWhisperBackend {
     ///
     /// If `config.mel_filters` is `None`, a deterministic Slaney mel filter bank
     /// matching `model_config.num_mel_bins` (`80` or `128`) is constructed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration is inconsistent with the device or
+    /// model, or if Candle cannot load the supplied weights.
     pub fn from_var_builder(
         vb: VarBuilder<'_>,
         config: CandleWhisperConfig,

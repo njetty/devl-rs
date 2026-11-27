@@ -130,7 +130,7 @@ pub struct CommitResult {
     pub tokens: Vec<TokenId>,
     /// Length of the longest matching prefix accepted from the latest draft.
     pub accepted_prefix_len: usize,
-    /// Length of the draft verified at commit time (after capping to `max_tokens`).
+    /// Length of the draft verified or promoted at commit time, capped at `max_tokens`.
     pub draft_len: usize,
     /// Number of autoregressive `decode_step` calls executed after rollback.
     pub decode_steps: usize,
