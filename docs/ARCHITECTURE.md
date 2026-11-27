@@ -351,6 +351,7 @@ Per Section 2 (item 4) and Section 3 of arXiv:2611.20064v1, TTFS is minimized un
 
 ### Qwen3-ASR (Planned for v0.2)
 
+- **Contract**: the pinned checkpoint, upstream evidence, reference procedure, reuse and invalidation rules, operation mapping, and open API decisions are specified in [Section 6](#6-qwen3-asr-compatibility-contract-v020). This subsection is a summary; Section 6 takes precedence.
 - **Upstream status**: `candle-transformers 0.11.1` includes `qwen3` / `qwen3_vl` text/vision models but does not yet provide a `qwen3_asr` module; v0.2 will implement the windowed audio encoder and Qwen3 decoder KV-cache wrapper directly over `candle-core` and `candle-nn`.
 - **Encoder behavior (fixed windows)**:
   - Per Table 1 of arXiv:2611.20064v1, Qwen3-ASR encodes fixed non-overlapping audio windows from stream start and prefills completed blocks into the LLM decoder KV cache once during speech.
@@ -358,3 +359,302 @@ Per Section 2 (item 4) and Section 3 of arXiv:2611.20064v1, TTFS is minimized un
 - **Decoder & KV-cache truncation**:
   - At verification, `verify_draft` forks/copies the cached block KV state from `encoding`, prefills only the uncached audio tail + prompt suffix + `draft[..k.saturating_sub(1)]`, and records `prompt_len` at the end of the prompt suffix.
   - `rollback_kv(kv, accepted_len)` truncates each Qwen3 decoder layer's `(k, v)` cache to `kv.prompt_len + accepted_len` and resets the RoPE position offset to `kv.prompt_len + accepted_len`, after which `decode_step` resumes autoregressive decoding identically to offline inference.
+
+---
+
+## 6. Qwen3-ASR Compatibility Contract (v0.2.0)
+
+This section fixes the model and offline reference contract for the planned Qwen3-ASR backend in `devl-candle`. It is a specification only. No model execution, loader, frontend, or trait change is implemented by it.
+
+Conventions used below:
+
+- **Upstream** statements describe what the pinned checkpoint and pinned upstream code do. Each carries a source reference. They were read from the pinned sources and, where marked **Observed**, confirmed by running the pinned code locally.
+- **Design** statements describe the planned Rust behavior. They are requirements for later issues, not descriptions of existing code.
+- All prose here is original. Nothing is copied from the DEVL paper or the Qwen3-ASR report.
+
+### 6.1 Pinned Artifacts
+
+| Item | Pin |
+| --- | --- |
+| Checkpoint | `Qwen/Qwen3-ASR-1.7B`, revision `7278e1e70fe206f11671096ffdd38061171dd6e5` (last modified 2026-01-30), Apache-2.0 |
+| Upstream code | [`QwenLM/Qwen3-ASR`](https://github.com/QwenLM/Qwen3-ASR) commit `7c6daf77a2421100f5fb066495372c00129d39ff` (package `qwen-asr` 0.0.6), Apache-2.0 |
+| Reference runtime | `transformers==4.57.6` (the version pinned by that package and recorded in the checkpoint `config.json`), `torch==2.8.0` for the validation run in 6.7 |
+| Weight shard 1 | `model-00001-of-00002.safetensors`, 4220320824 bytes, sha256 `a4cd1f1a04d90b757dc7f7dd26254e69a013b19e80efe590a83c6a3bde8608d6` |
+| Weight shard 2 | `model-00002-of-00002.safetensors`, 478200688 bytes, sha256 `6e0b9d9e09e2e0238e7ef3cc8a484ab387e91b90f1900bedf88bc92d7929ccfc` |
+
+Supported scope for v0.2.0 is this single checkpoint revision. Other Qwen3-ASR checkpoints (including the 0.6B model and the forced-aligner model, which reuses the same code with a different head) are unsupported until each is verified against this contract. A different revision of the same repository is also unsupported until re-verified.
+
+Primary sources (all at the pins above):
+
+- Checkpoint files: [`config.json`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B/blob/7278e1e70fe206f11671096ffdd38061171dd6e5/config.json), [`generation_config.json`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B/blob/7278e1e70fe206f11671096ffdd38061171dd6e5/generation_config.json), [`preprocessor_config.json`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B/blob/7278e1e70fe206f11671096ffdd38061171dd6e5/preprocessor_config.json), [`tokenizer_config.json`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B/blob/7278e1e70fe206f11671096ffdd38061171dd6e5/tokenizer_config.json), [`chat_template.json`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B/blob/7278e1e70fe206f11671096ffdd38061171dd6e5/chat_template.json), [`model.safetensors.index.json`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B/blob/7278e1e70fe206f11671096ffdd38061171dd6e5/model.safetensors.index.json).
+- Model code: `qwen_asr/core/transformers_backend/modeling_qwen3_asr.py` (cited as `modeling`), `.../processing_qwen3_asr.py` (`processing`), `qwen_asr/inference/qwen3_asr.py` (`inference`), `qwen_asr/inference/utils.py` (`utils`), each under the upstream commit above.
+- Feature extractor: `src/transformers/models/whisper/feature_extraction_whisper.py` at tag `v4.57.6` of `huggingface/transformers` (cited as `whisper_fe`). The checkpoint declares `WhisperFeatureExtractor` in `preprocessor_config.json`.
+
+### 6.2 Weight Layout (Upstream)
+
+- Format: 2 safetensors shards indexed by `model.safetensors.index.json`, 708 tensors, stored dtype `bfloat16` (`config.json`, `thinker_config.dtype`).
+- Architecture class `Qwen3ASRForConditionalGeneration`, `model_type` `qwen3_asr`. All weights live under a single `thinker.` prefix, in three groups:
+  - `thinker.audio_tower.*`: a convolutional front stack (`conv2d1`, `conv2d2`, `conv2d3`, `conv_out`), 24 transformer layers (`layers.N.{self_attn.{q,k,v,out}_proj, self_attn_layer_norm, fc1, fc2, final_layer_norm}`, all with bias), `ln_post`, `proj1`, `proj2`. Sinusoidal position embeddings are a non-persistent buffer and have no tensor in the checkpoint (`modeling` line 579).
+  - `thinker.model.*`: the text decoder. Token embeddings `embed_tokens`, 28 layers (`input_layernorm`, `self_attn.{q,k,v,o}_proj` without bias, per-head `self_attn.q_norm` and `self_attn.k_norm`, `post_attention_layernorm`, `mlp.{gate,up,down}_proj`), final `norm`.
+  - `thinker.lm_head.weight`: shape `[151936, 2048]`.
+- Audio encoder dimensions (`config.json`): 24 layers, `d_model` 1024, 16 heads, FFN 4096, 128 mel bins, `downsample_hidden_size` 480, `output_dim` 2048, `n_window` 50, `n_window_infer` 800.
+- Text decoder dimensions: 28 layers, `hidden_size` 2048, 16 query heads, 8 KV heads, `head_dim` 128, `intermediate_size` 6144, `rms_norm_eps` 1e-6, `rope_theta` 1000000, `vocab_size` 151936, SiLU gated MLP, no attention bias, no sliding window.
+- **Observed**: `thinker.lm_head.weight` and `thinker.model.embed_tokens.weight` are both present in shard 1 and are bit-identical (`torch.equal` on the loaded bf16 tensors). `tie_word_embeddings` is `true` in both sub-configs.
+- Design: a Candle `VarBuilder` over the safetensors files with prefixes `thinker.audio_tower`, `thinker.model`, and `thinker.lm_head`. The loader may read `lm_head.weight` as stored. Tying is not required for correctness at this revision, but the loader must not assume the tensor is absent.
+
+### 6.3 Audio Input and Frontend (Upstream)
+
+Sources: `whisper_fe` lines 94-169, `preprocessor_config.json`, `processing` lines 105-118, `utils` lines 164-203.
+
+- Input contract: mono, 16 kHz, `f32`. The upstream wrapper resamples to 16 kHz and peak-normalizes only when the absolute peak exceeds 1.0 (`float_range_normalize`). For input already in `[-1.0, 1.0]` this is the identity, which matches the `DevlBackend` input invariant in Section 2.
+- The processor forces `padding=True` and `truncation=False` for audio. For a single clip this means **no padding to 30 seconds and no truncation**: the feature length equals the clip length. This differs from Whisper, and the existing `crates/devl-candle/src/mel.rs` (fixed 30 s window, 3000 frames) cannot be reused unchanged.
+- Features: 128 mel bins, `n_fft` 400, `hop_length` 160 (10 ms frames), no dither, no waveform zero-mean normalization (`do_normalize` is false). Mel filters: Slaney scale and Slaney normalization, 0 to 8000 Hz.
+- Spectrogram steps (torch path, used whenever torch is installed): periodic Hann window, `torch.stft` with its defaults (centered, reflect padding of `n_fft / 2` samples at both ends), drop the last STFT frame, power spectrum, mel projection, `log10` with a floor of `1e-10`, then **clamp to `max(log_spec) - 8.0` where the max is taken over every frame of the clip**, then `(x + 4.0) / 4.0`. The frame count for `S` samples is `F = floor(S / 160)`.
+- Consequences used by the reuse rules in 6.8:
+  1. The log-floor depends on the global maximum, so any new audio can change every earlier frame. This is the normalization that cached blocks must be validated against.
+  2. Frame `i` is centered at sample `160 * i` and spans `[160 * i - 200, 160 * i + 200)`. Frame `i` is final once `S >= 160 * i + 200`. Frames nearer the end are computed with reflect padding and change when more audio arrives.
+- Short clips: the upstream wrapper zero-pads any chunk shorter than 0.5 s (8000 samples) at the tail (`utils` line 323). Clips longer than 1200 s are split at low-energy boundaries (`MAX_ASR_INPUT_SECONDS`, `utils` line 34). The splitting path is outside this contract, in the same way epoch cutting is outside the exactness guarantee in Section 3.
+- **Observed** (aarch64 CPU, `transformers 4.57.6`, one 15.05 s English clip, probe script not committed): scaling the first 8 s of the clip by 0.05 so the global maximum moved to a later frame changed all 800 frames of the first 8 s window (max abs difference 0.54) between a truncated pass and the full-clip pass. With the original clip, where the maximum lies in the first window, the first window was bit-identical between truncations. Frame 799 became bit-identical at `S = 128039` rather than `128040`, which is attributed to the near-zero final Hann tap. The contract uses the conservative bound `160 * i + 200`.
+
+### 6.4 Encoder Windowing (Upstream)
+
+Sources: `modeling` lines 309-317, 669-740, `config.json` audio config.
+
+- The mel sequence is split into chunks of `2 * n_window = 100` frames (1 s). Each chunk passes independently through three stride-2 convolutions (GELU after each), then `conv_out`, then the chunk-local sinusoidal position embedding (positions restart at 0 in every chunk).
+- A full 100-frame chunk yields 13 tokens. For `F` frames the encoder yields `N(F) = 13 * (F / 100) + g(F % 100)` tokens with integer division, where `g(r) = ((((r - 1) / 2 + 1) - 1) / 2 + 1 - 1) / 2 + 1` using floor division as written in `_get_feat_extract_output_lengths` (`g(0) = 0`). Audio runs at 13 tokens per second.
+- Self-attention in the 24 encoder layers is bidirectional inside a block and does not cross blocks. Block length is `13 * (n_window_infer / (2 * n_window)) = 104` tokens, which is 800 mel frames (8 s). The last block is shorter. After `ln_post`, `proj1`, GELU, and `proj2`, each token is a 2048-dimensional vector matching the decoder hidden size.
+- Therefore the output for any complete 8 s block depends only on the 800 mel frames of that block (plus the weights). The output for the trailing partial block depends on all of its frames and changes when frames are appended. Conv-chunk outputs are also independent per 1 s chunk, which permits an optional finer cache, but attention couples tokens within a block, so the block is the unit of reuse.
+
+### 6.5 Prompt, Audio Placement, Language, and EOS (Upstream)
+
+Sources: `chat_template.json`, `inference` lines 454-465 and 490-520, `processing` lines 105-160, `utils` lines 403-470, `generation_config.json`, `modeling` line 1329.
+
+Prompt text for the default (empty context, no forced language):
+
+```text
+<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n
+```
+
+The processor replaces the single `<|audio_pad|>` with `N(F)` copies. With the pinned tokenizer (loaded with `fix_mistral_regex=True`, as upstream does) the ids are:
+
+| Segment | Token ids | Count |
+| --- | --- | --- |
+| Prefix | `151644 8948 198 151645 198 151644 872 198 151669` | 9 |
+| Audio | `151676` repeated `N` times | `N` |
+| Suffix | `151670 151645 198 151644 77091 198` | 6 |
+
+Prompt length without a forced language is `P = 15 + N`. Special ids: `<|im_start|>` 151644, `<|im_end|>` 151645, `<|endoftext|>` 151643, `<|audio_start|>` 151669, `<|audio_end|>` 151670, `<|audio_pad|>` 151676, `<asr_text>` 151704.
+
+- Audio placement: the decoder embeds the full prompt, then replaces the embeddings at every `<|audio_pad|>` position, in order, with the encoder outputs (`masked_scatter`, `modeling` line 1203). Audio embeddings are inputs to layer 0, not cross-attention. There is no separate audio KV cache.
+- Language handling: with no forced language the model generates `language <Name><asr_text>` followed by the transcript. For English the generated ids start `11528 6364 151704` (`language`, ` English`, `<asr_text>`). With a forced language, upstream appends `language <Name><asr_text>` to the prompt text (`inference` line 454-465), so those tokens belong to the prompt and the model emits only the transcript. The supported language names are listed in `config.json` (`support_languages`, 30 entries). The default context is the empty string. A non-empty context is placed in the system turn and is unsupported until verified.
+- Output parsing (`parse_asr_output`, which also applies `detect_and_fix_repetitions`) is text post-processing. It is not part of the token contract. Comparisons use raw generated token ids.
+- EOS: `generate` stops on either `151645` (`<|im_end|>`) or `151643` (`<|endoftext|>`) (`generation_config.json` and `modeling` line 1329). `tokenizer_config.json` names `<|im_end|>` as `eos_token`. **Observed**: the validation run in 6.7 ended with `151645`.
+- Decoding: greedy (`do_sample` false, single beam). `suppress_tokens` is null in both sub-configs, so no logit suppression applies. The upstream wrapper default is `max_new_tokens=512`.
+
+### 6.6 Position and RoPE Semantics (Upstream)
+
+Sources: `modeling` lines 414-448, 802-838, 1220-1230, text attention at 877-960.
+
+- The text model is configured with interleaved multi-axis RoPE (`mrope_section` `[24, 20, 20]`), but position ids are built by `get_rope_index` as `cumsum(attention_mask) - 1`, expanded identically to all three axes. For a single unpadded sequence the positions are `0, 1, ..., L - 1` on every axis and `rope_deltas` is `0`. During decoding the position of the next token is `cache_position + rope_deltas`, which is its absolute index.
+- With identical positions on all axes, the interleaved layout selects the same angle for every frequency, so the rotation equals standard 1-D RoPE with `rope_theta` 1e6 over `head_dim` 128 (rotate-half form). Audio tokens consume ordinary consecutive positions inside the prompt. There is no separate audio position grid.
+- Per layer: `q_norm` and `k_norm` (RMSNorm over `head_dim`) are applied before RoPE, and the cached keys are post-RoPE.
+- **Observed**: `rope_deltas == 0` for the validation clip, and `prompt_len == 15 + N`.
+- Consequence for rollback: the "RoPE position offset" for the next token equals the current KV length. After `rollback_kv(kv, n)` the next fed token is at absolute position `P + n`. No separate offset state is needed as long as keys are cached post-RoPE and the cache length is the single source of truth.
+
+### 6.7 Upstream Greedy Reference Procedure
+
+Purpose: produce, for a fixed clip, the offline greedy token ids, the prompt ids, the audio token count, the mel features, the encoder outputs, and per-step argmax margins, so the Rust backend can be compared artifact by artifact.
+
+Environment (pinned in 6.1):
+
+```bash
+python3 -m venv ref-venv && . ref-venv/bin/activate
+pip install torch==2.8.0 transformers==4.57.6 accelerate==1.12.0 huggingface_hub \
+  nagisa==0.2.11 soynlp==0.0.493 qwen-omni-utils sox pytz librosa soundfile
+pip install --no-deps \
+  "git+https://github.com/QwenLM/Qwen3-ASR@7c6daf77a2421100f5fb066495372c00129d39ff"
+python -c "from huggingface_hub import snapshot_download as s; s('Qwen/Qwen3-ASR-1.7B', \
+  revision='7278e1e70fe206f11671096ffdd38061171dd6e5', local_dir='ckpt')"
+sha256sum ckpt/model-0000*.safetensors   # must match the table in 6.1
+```
+
+A local snapshot is required: upstream loads the processor from the given path without a revision argument, so a hub id would resolve the tokenizer at the moving default branch.
+
+Input clip: mono, 16 kHz, at least 8000 samples, peak at most 1.0. For example `ffmpeg -i in.wav -ac 1 -ar 16000 -sample_fmt s16 clip.wav`. The script asserts the format instead of converting, so the Rust side and upstream read identical samples. 16-bit PCM is read as `f32` by dividing by 32768.
+
+Command:
+
+```bash
+mkdir -p out
+python qwen3_asr_reference.py --ckpt ckpt --wav clip.wav --out out/clip \
+  --dtype float32 --max-new-tokens 512
+# Append --language English for the forced-language run.
+```
+
+`qwen3_asr_reference.py`:
+
+```python
+import argparse, hashlib, json
+import numpy as np, soundfile as sf, torch
+from qwen_asr import Qwen3ASRModel
+
+EOS_IDS = (151645, 151643)
+ap = argparse.ArgumentParser()
+ap.add_argument("--ckpt", required=True)
+ap.add_argument("--wav", required=True)
+ap.add_argument("--out", required=True)
+ap.add_argument("--language", default=None)
+ap.add_argument("--max-new-tokens", type=int, default=512)
+ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
+args = ap.parse_args()
+
+asr = Qwen3ASRModel.from_pretrained(
+    args.ckpt, dtype=getattr(torch, args.dtype), device_map="cpu",
+    max_new_tokens=args.max_new_tokens)
+wav, sr = sf.read(args.wav, dtype="float32", always_2d=False)
+assert sr == 16000 and wav.ndim == 1 and len(wav) >= 8000 and np.abs(wav).max() <= 1.0
+
+prompt = asr._build_text_prompt(context="", force_language=args.language)
+inputs = asr.processor(text=[prompt], audio=[wav], return_tensors="pt", padding=True)
+inputs = inputs.to(asr.model.device).to(asr.model.dtype)
+prompt_ids = inputs["input_ids"][0].tolist()
+
+with torch.no_grad():
+    out = asr.model.generate(**inputs, max_new_tokens=args.max_new_tokens,
+                             do_sample=False, num_beams=1, output_scores=True)
+gen = out.sequences[0, len(prompt_ids):].tolist()
+cut = next((i + 1 for i, t in enumerate(gen) if t in EOS_IDS), len(gen))
+gen = gen[:cut]
+
+margins = []
+for step, tok in enumerate(gen):
+    top2 = torch.topk(out.scores[step][0].float(), 2)
+    assert top2.indices[0].item() == tok
+    margins.append((top2.values[0] - top2.values[1]).item())
+
+feats = inputs["input_features"][0].float().cpu().numpy()          # [128, F]
+with torch.no_grad():
+    embeds = asr.model.thinker.get_audio_features(
+        inputs["input_features"],
+        feature_attention_mask=inputs["feature_attention_mask"]).float().cpu().numpy()  # [N, 2048]
+np.save(args.out + ".mel.npy", feats)
+np.save(args.out + ".audio_embeds.npy", embeds)
+
+audio_pad = asr.model.config.thinker_config.audio_token_id
+rope_deltas = asr.model.thinker.rope_deltas
+json.dump({
+    "dtype": args.dtype, "language": args.language, "num_samples": len(wav),
+    "mel_shape": list(feats.shape), "mel_sha256": hashlib.sha256(feats.tobytes()).hexdigest(),
+    "prompt_ids": prompt_ids, "prompt_len": len(prompt_ids),
+    "audio_pad_count": prompt_ids.count(audio_pad),
+    "first_audio_pad_index": prompt_ids.index(audio_pad),
+    "generated_ids": gen, "reached_eos": bool(gen) and gen[-1] in EOS_IDS,
+    "argmax_margins": margins,
+    "rope_deltas": rope_deltas.flatten().tolist() if rope_deltas is not None else None,
+}, open(args.out + ".json", "w"), indent=2)
+```
+
+Artifacts and how each is compared against the Rust backend (same clip, same dtype, same language setting):
+
+| Artifact | Source | Comparison |
+| --- | --- | --- |
+| `prompt_ids` | `.json` | Exact equality with the ids the backend builds, including `N` and `P`. |
+| `generated_ids` | `.json` | Exact equality with the DEVL session output tokens (including the final EOS) when `SessionConfig::max_tokens` equals `--max-new-tokens`. On mismatch report the first differing index, both ids, and `argmax_margins[i]`. |
+| Positions | derived | The reference position of token `j` of the full sequence is `j` on every axis (`rope_deltas` must be `0`). Assert backend KV length equals `P` after prefill and `P + n` after `rollback_kv(kv, n)`, and that `decode_step` after rollback feeds position `P + n`. |
+| `mel.npy` | `.npy` | Elementwise comparison of the backend frontend output, shape `[128, F]`. Tolerances are to be set from measurements in the parity issue and recorded with hardware and commit. |
+| `audio_embeds.npy` | `.npy` | Elementwise comparison of the backend encoder output, shape `[N, 2048]`. Same tolerance policy. |
+| `argmax_margins` | `.json` | Used to investigate token mismatches. A small margin can indicate a numerical near-tie; a large margin warrants checking implementation and settings. |
+
+Run the reference twice per fixture: forced language and automatic language. For strict token parity use `--dtype float32` on both sides. A `bfloat16` run is a separate, looser comparison because bf16 logits make near-ties more likely (see Section 3, item 4).
+
+**Observed** (validation run of this exact script, aarch64 CPU, `float32`, 15.05 s English clip, language auto, `--max-new-tokens 128`, checkpoint revision from 6.1): `F = 1505`, mel shape `[128, 1505]`, `N = 196`, `prompt_len = 211`, `first_audio_pad_index = 9`, `rope_deltas = [0.0]`, 48 generated ids beginning `11528 6364 151704` and ending `151645`, `reached_eos = true`. The same script with `--language English` gave `prompt_len = 214` (`15 + N + 3`, the three extra ids being `language`, ` English`, `<asr_text>`) and 45 generated ids equal to the automatic run's ids after its first three, again ending in `151645`. The script text above was extracted from this document and run unmodified. These values confirm the formulas in 6.3 to 6.6 on one clip. They are not performance or accuracy measurements.
+
+### 6.8 Rust Design: Reuse and Invalidation
+
+Design for `Qwen3AsrAudioEncoding` (name provisional). The encoding is an immutable value; `encode_audio(&self, ...)` returns a new one and shares unchanged parts with `prior_encoding` by reference counting (Candle tensors are reference counted).
+
+State recorded in an encoding built from `S` samples:
+
+- `S`, a content fingerprint of the samples that back each reusable block, the frame count `F`, and the log-floor `floor = max(log10 mel over all F frames) - 8.0` as `f32`.
+- Per complete 800-frame block `k`: the clamped input features it was encoded from, its `min` raw (pre-clamp) log10 mel value, its 104 audio embeddings, and the per-layer decoder K/V for the prompt prefix plus blocks `0..=k`.
+- The trailing partial block: its embeddings only (never cached across calls).
+
+Block `k` is **complete** when `S >= 160 * (800 * k + 799) + 200`, i.e. the last frame of the block is final (6.3).
+
+`encode_audio(pcm, prior)` algorithm:
+
+1. Apply the short-clip pad to `pcm` if `S < 8000` (as a pure function of `pcm`, so every call agrees). Reject `S` above the supported limit (see D4 in 6.10).
+2. Compute mel for the whole `pcm`, yielding `F`, `floor_new`, and the raw values needed for per-block minima. Cost is linear in `S`. Only the encoder, prefill, and KV are expensive.
+3. Decide per block whether `prior` can be reused. Block `k` is reusable only if all hold:
+   - `prior` is `Some` and block `k` is cached in `prior` (it was complete in `prior`);
+   - the fingerprint of `pcm[..end of block k]` equals the stored fingerprint, which establishes that `pcm` extends the prior audio (the session guarantees this today, but the backend must not rely on it, because `prior_encoding` is an unchecked argument);
+   - the language mode and prompt prefix are unchanged;
+   - the normalization check passes: either `floor_new == floor_old` (exact `f32` equality), or `block_min_raw >= max(floor_old, floor_new)`, in which case the clamp is inactive under both floors and the block's features are unchanged. A conservative implementation may skip the second clause and invalidate on any floor change.
+4. Reuse is prefix-closed. Let `m` be the largest count such that blocks `0..m` are all reusable. Blocks at or after `m` are re-encoded, and the decoder prefill restarts from the end of block `m - 1`. A reused block after an invalidated block is not valid because its K/V were computed on top of the invalidated prefix.
+5. Encode the new complete blocks and the partial tail with the audio tower, then extend the cached prefix K/V by running the decoder over the prefix tokens (when `m == 0`) and the newly completed blocks only. Positions are absolute, `0..` from the start of the prompt, so reused entries stay correct.
+
+What is never reused: tokens after the last complete block (the partial tail, `<|audio_end|>`, the suffix, any forced-language tokens), because `N` grows with audio and every later position shifts. These are recomputed on each `verify_draft` and sit between `P` boundaries as follows:
+
+```text
+ positions:  0 .. 8 | 9 .. 9+104m-1 | 9+104m .. 9+N-1 | 9+N .. 14+N | (forced language) | generated
+ content:    prefix | complete blocks | partial tail     | suffix      | optional prompt    | draft/decode
+ cached:     yes      yes (per block)   no                no            no                   per pass
+                                                       ^ P = 15 + N (+ forced-language tokens)
+```
+
+Exactness notes:
+
+- Cached K/V for a block are bit-identical to offline prefill only if the same kernels and shapes are used. Prefill of the prefix in a separate call from the remainder changes matmul shapes. This is the same floating-point tie caveat as Section 3, item 4. Strict parity tests use `f32`, and any residual mismatch is analyzed with the logit margins from 6.7, not hidden.
+- The 8 s block size in 6.4 is a property of the checkpoint (`n_window_infer`), not a tunable.
+- Memory per cached token is `2 * 28 * 8 * 128` elements (K and V, 28 layers, 8 KV heads, head dim 128), so 57344 elements per token, 104 tokens per block. A bound derived from shapes, not a measurement.
+
+### 6.9 Mapping to Existing `DevlBackend` Contracts
+
+| Operation | Qwen3-ASR behavior (Design) | Existing contract it must satisfy |
+| --- | --- | --- |
+| `eos_token()` | Returns `151645`. See D1 for the second stop id `151643`. | Single `TokenId`. |
+| `sample_rate_hz()` | `16_000`, the trait default. | Default method. |
+| `new_kv_cache()` | Empty decoder cache, no prompt, `prompt_len = 0`. Cannot see the encoding. | `&self`, `Result`. |
+| `encode_audio(pcm, prior)` | Algorithm in 6.8. Returns the new encoding, sharing reusable blocks with `prior`. Runs the audio tower and any new prefix prefill. | `prior_encoding: Option<&AudioEncoding>`, deterministic function of `pcm`. Whole-buffer input from stream start. |
+| `verify_draft(enc, kv, draft)` | Seed `kv` from the cached prefix in `enc` (cheap clone of shared tensors, appends allocate new tensors so the shared prefix is never mutated). Prefill the uncached tail, suffix, optional forced-language tokens, and `draft[..k.saturating_sub(1)]` in one causal pass. Set `prompt_len = P` after the prompt part. Return argmax over positions `P - 1 .. P - 1 + k.max(1)`. | `argmax_tokens.len() == k.max(1)`. Position 0 is predicted from the end of the prompt. Same slicing as Whisper in Section 5. |
+| `rollback_kv(kv, n)` | Truncate each layer's K and V to `P + n` entries. Never cut into the shared cached prefix, which is guaranteed because `P + n >= P > prefix length`. No RoPE state to reset (6.6). | Retains prompt plus exactly `n` generated tokens. |
+| `decode_step(enc, kv, tok)` | Feed one token at absolute position `kv.len()`, append post-RoPE K/V, return greedy argmax with no suppression. | Output identical to offline greedy at that position. |
+
+Protocol-level mapping:
+
+- **Verification** is the existing single pass in `devl-core` (longest matching prefix, `p = d[..a] ++ argmax[a]`). Backends contribute only `verify_draft`. Nothing here duplicates prefix matching or rollback selection.
+- **Draft-over-new-audio**: after more audio arrives, the previous draft is verified against the new encoding. Because the prompt suffix and `N` changed, the draft is a guess about the new offline output and is accepted only up to the first argmax disagreement. This is the normal DEVL case.
+- **Promotion**: direct promotion in `commit()` requires `draft_audio_len == audio_buffer.len()`, which makes normalization trivially unchanged. No Qwen-specific handling is needed.
+- **Rollback**: truncation to `P + n` reproduces offline state after `n` generated tokens because cached keys are post-RoPE at absolute positions and no cached entry depends on later tokens (causal decoder).
+- **Commit with unchanged audio but no EOS draft**: the session passes `last_encoding` for the same buffer. The backend may reuse the entire encoding (all fingerprints match, floor equal) and skip re-encoding.
+
+### 6.10 API Decisions Required Before Implementation
+
+None of these is implemented here. Each must be settled in the issue that needs it. Items marked "trait" would change `devl-core`, which this milestone's issue #22 does not authorize.
+
+- **D1, second stop token (trait).** The model stops on `151645` or `151643`. `DevlBackend::eos_token()` returns one id and `devl-core` compares with `==` (`session.rs` lines 397, 419, 441, 452). If the model ever emits `151643`, the session would not stop where upstream does. Options: (a) extend the trait with an EOS predicate or id set, defaulting to `token == eos_token()`; (b) keep one id and treat `151643` as unsupported, verifying on fixtures that it is not emitted. Recommendation: (b) for the first parity issue with an assertion in the reference tooling that generated ids contain no `151643`, including at the final position, and (a) if any fixture violates it.
+- **D2, forced language (no trait change).** Language mode is fixed per backend instance or session and changes the prompt (and therefore `P`). It belongs in backend construction options. Changing it invalidates every cached block. Tokenizing `language <Name><asr_text>` for 30 names needs either the Qwen2 byte-level BPE (vocab, merges, and the regex fix noted in 6.5) or a verified id table. Decide which in the loader issue.
+- **D3, prior encoding validation (no trait change).** The trait accepts any `&AudioEncoding` as prior. The backend must store and check fingerprints (6.8). Decide the fingerprint (full compare of retained samples versus a hash).
+- **D4, supported duration bounds (no trait change).** Minimum 8000 samples (pad) and maximum 1200 s (`MAX_ASR_INPUT_SECONDS`) match upstream. At 13 tokens per second, 1200 s is 15600 audio tokens in one prefill. Decide whether v0.2.0 enforces a smaller cap and which `Error` variant reports it.
+- **D5, cached-state ownership (no trait change).** `AudioEncoding` will hold reference-counted per-block K/V. `new_kv_cache()` takes no encoding, so `verify_draft` performs the seeding. Confirm that `AudioEncoding: Send` (and `Sync` where `PriorityScheduler` shares it) holds for Candle tensors on all supported devices before choosing the representation.
+- **D6, pre-emption granularity (no trait change, scheduler note).** `encode_audio` and `verify_draft` run before the first `should_preempt` check (Section 4). With a reusable prefix, encoder and prefix prefill work scales with uncached blocks. Whole-buffer mel and cache validation still scale with clip length, and invalidation can require rebuilding the entire prefix. No change is proposed, but checkpoint cadence should be documented in the server issue.
+- **D7, frontend reuse (no trait change).** The existing `mel.rs` pads to 30 s and supports 80 or 128 bins. Qwen3 needs a variable-length 128-bin frontend with the global-floor semantics of 6.3. Whether `candle_transformers` `pcm_to_mel` can be made to match without padding is unverified (see 6.12).
+
+### 6.11 Consistency Check with Current Protocol Signatures
+
+Checked against `crates/devl-core/src/backend.rs` and `session.rs` at the base of this change:
+
+- The six `DevlBackend` methods, associated types, and defaults match the signatures reproduced in Section 2. The Qwen3-ASR plan needs no new method and no changed signature, apart from the conditional D1.
+- `DevlSession` calls `encode_audio(&self.audio_buffer, self.last_encoding.as_ref())` in both `run_draft_cancellable` and `commit`, always with the full buffer from stream start. This matches the fixed-window reuse model. `last_encoding` is updated only after a successful pass and cleared by `reset()`, so a stale prior never outlives its stream in normal use. D3 covers direct misuse.
+- `verify_and_continue` constructs a fresh cache per pass, verifies, rolls back to `tokens.len() - 1`, and decodes from the last token. This is the convention assumed in 6.9.
+- Observed drift in existing prose, not addressed here: the step list in Section 3 describes acceptance as longest prefix with `a == k` meaning all draft tokens match, while `verify_and_continue` also stops accepting at the first matching `eos` inside the draft (`accepted_eos`). The behaviors agree for drafts that end in EOS. A documentation follow-up may be warranted, but it is out of scope for #22.
+- `SessionConfig::default().max_tokens` is 448, while the upstream wrapper default is 512. Reference comparisons must set both to the same value explicitly (6.7).
+
+### 6.12 Remaining Uncertainties
+
+- The reference script was run on CPU in `float32` on one English clip, in automatic and forced-language modes. It has not been run on GPU, in `bfloat16`, or on clips longer than one 8 s block with a moving global maximum beyond the synthetic probe in 6.3.
+- Bitwise equality of block-wise prefill versus whole-prompt prefill in Candle is untested. Parity at the token level is the target. Numerical equality of embeddings and K/V is not promised.
+- Whether Candle's mel helper reproduces the torch path (centered reflect STFT, dropped last frame, global floor) within tolerance for variable-length input is unverified.
+- Tokenizer fidelity: the checkpoint ships `vocab.json` and `merges.txt` but no `tokenizer.json`, and loading emits a regex warning that upstream resolves with `fix_mistral_regex=True`. A Rust tokenizer for forced-language prompts has not been checked.
+- The second stop id `151643` behavior is untested beyond the single observed `151645` ending.
+- The upstream streaming path (`init_streaming_state` and `streaming_transcribe`, vLLM only) re-feeds all audio and prefixes the prompt with prior text minus a few tokens. It is a different heuristic that does not give the offline-exact guarantee, and it is not the reference for this project.
