@@ -32,8 +32,11 @@ Operational rules for coding agents and contributors working in `njetty/devl-rs`
 1. **Inspect before coding:** Read the assigned issue with `gh issue view <number> --comments` and verify alignment with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and the active phase in [docs/ROADMAP.md](docs/ROADMAP.md).
 2. **Use a dedicated branch:** Work on a branch named `<type>/<issue-number>-<short-slug>` (for example, `feat/4-whisper-mel-frontend`) unless explicitly instructed to commit directly to `main`.
 3. **Sign and scope commits:** Keep every commit cryptographically signed (`required_signatures` is enforced on `main`), scoped strictly to one issue, and linked in commit messages and PR descriptions using `Closes #<number>` (or `Refs #<number>` for partial work).
-4. **Enforce acceptance criteria:** Never close an issue unless every acceptance criterion is satisfied and all verification commands pass.
-5. **Prevent silent scope creep:** If an out-of-scope bug or follow-up task is discovered during implementation, do not expand the current diff. Propose a follow-up issue and create it via `gh issue create` only after confirmation.
+4. **Two-stage draft-to-ready PR handoff:**
+   - **Stage 1 — Implementation subthread (draft PR):** Run the local verification gate below, push signed commit(s) to `<type>/<issue-number>-<short-slug>`, verify commit signature status, open the pull request as a **draft** (`gh pr create --draft`) referencing `Closes #<number>`, and hand back immediately without polling or watching CI.
+   - **Stage 2 — Parent orchestrator / maintainer (review, live CI, and merge):** Review the diff, monitor the live GitHub CI checks on `HEAD`, mark the pull request ready for review (`gh pr ready`) once all six required checks pass on `HEAD`, and squash-merge into `main`.
+5. **Enforce acceptance criteria:** Never close an issue or mark a pull request ready unless every acceptance criterion is satisfied and all required checks pass.
+6. **Prevent silent scope creep:** If an out-of-scope bug or follow-up task is discovered during implementation, do not expand the current diff. Propose a follow-up issue and create it via `gh issue create` only after confirmation.
 
 ## Verification Gate (Run Before Every Commit / PR)
 

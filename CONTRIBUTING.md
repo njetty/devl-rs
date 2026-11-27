@@ -121,9 +121,9 @@ cargo check -p devl --all-targets --features metal
 
    Add the corresponding public key under **GitHub Settings → SSH and GPG keys** as a **Signing Key** (separate from an Authentication Key).
 2. **Push your branch.** Maintainers push feature branches to `njetty/devl-rs`. Outside contributors push to their fork and open a pull request against `main`.
-3. **Open as a draft while iterating.** Once local checks pass, open a draft pull request so the multi-platform CI matrix starts early.
+3. **Open as a draft first.** Once the local verification gate passes, open a draft pull request (`gh pr create --draft`) so the multi-platform CI matrix starts early and the diff can be reviewed before marking ready.
 4. **Write a plain imperative title.** For example: `Implement Whisper self-attention KV cache and rollback`. Omit bracketed prefixes such as `[feat]` or `[bug]`—use a `type:` label instead.
-5. **Explain the change and verification in the description.** State what changes for callers, why, and the exact commands you ran locally.
+5. **Complete the pull request template.** Explain what changes for callers and why, list the exact local verification commands run, and check off the pre-push items in the readiness checklist. Live CI status is enforced on GitHub rather than via a manual PR-body checkbox.
 
 ### Choose a label
 
@@ -168,12 +168,14 @@ If CI fails on any platform, push the smallest fix (signed) to the same pull req
 
 ## Mark it ready for review
 
-Mark the pull request ready for review when all of the following hold for its current `HEAD` commit:
+Readiness and merge are gated by live GitHub status checks enforced on `HEAD` by the `Protect main` ruleset rather than a manual checkbox in the pull request description. Mark the pull request ready for review (`gh pr ready`) when the diff has been reviewed and all of the following hold for its current `HEAD` commit:
 
-1. All six required CI checks passed on the current commit (queued, cancelled, skipped, or earlier-commit runs do not count).
+1. All six required live GitHub CI checks pass on the current `HEAD` commit (queued, cancelled, skipped, or earlier-commit runs do not count).
 2. Every commit in the pull request has a GitHub-verified cryptographic signature.
-3. The diff against `main` contains only files needed for this change, with no unrelated edits.
+3. All pre-push items in `.github/PULL_REQUEST_TEMPLATE.md` are satisfied, and the diff against `main` contains only files needed for this change, with no unrelated edits.
 4. All affected documentation (`docs/ARCHITECTURE.md`, rustdoc, and `README.md` if applicable) is updated in the same pull request.
+
+For delegated agent workflows, the implementation subthread opens the draft pull request after local verification and hands back immediately; the parent orchestrator or maintainer monitors live CI checks, marks the pull request ready, and squash-merges (see [AGENTS.md](AGENTS.md)).
 
 Pull requests are squash-merged into `main` to preserve linear history, and merged branches are deleted automatically.
 
