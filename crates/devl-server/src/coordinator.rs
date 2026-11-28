@@ -282,6 +282,11 @@ where
         Ok(StreamSession { stream })
     }
 
+    /// Per-stream limits enforced (and advertised in `Started`) for every stream.
+    pub fn limits(&self) -> StreamLimits {
+        self.shared.config.limits
+    }
+
     /// Current counters.
     pub fn stats(&self) -> CoordinatorStats {
         let s = &self.shared;
