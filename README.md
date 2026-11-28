@@ -20,8 +20,8 @@ Offline speech recognition models typically achieve lower error rates than strea
                          v               v (optional: candle / metal / cuda)
           +-------------------+     +-------------------+
           |     devl-core     | <-- |    devl-candle    |
-          | (trait, session,  |     | (Candle Whisper   |
-          |  scheduler, mock) |     |  backend)         |
+          | (trait, session,  |     | (Candle Whisper,  |
+          |  scheduler, mock) |     |  Qwen3-ASR)       |
           +-------------------+     +-------------------+
 ```
 
@@ -29,7 +29,7 @@ Offline speech recognition models typically achieve lower error rates than strea
 | :--- | :--- | :--- |
 | `devl` | Top-level facade re-exporting `devl-core` (`devl::*`, `devl::core`) and optional backends (`devl::candle`). | `candle`, `metal`, `cuda`, `test-utils` |
 | `devl-core` | Runtime- and transport-agnostic core crate (zero ML or networking dependencies). Owns `DevlBackend`, `DevlSession`, single-pass verification and KV rollback, `PriorityScheduler`, and `MockBackend`. | `test-utils` |
-| `devl-candle` | Local inference backend over `candle-core`, `candle-nn`, and `candle-transformers` for Whisper. | `metal`, `cuda` |
+| `devl-candle` | Local inference backend over `candle-core`, `candle-nn`, and `candle-transformers` for Whisper and Qwen3-ASR. | `metal`, `cuda` |
 
 See [docs/ARCHITECTURE.md](https://github.com/njetty/devl-rs/blob/main/docs/ARCHITECTURE.md) for trait signatures, exactness invariants, session states, and scheduler preemption rules, and [docs/ROADMAP.md](https://github.com/njetty/devl-rs/blob/main/docs/ROADMAP.md) for the multi-release plan.
 
@@ -40,13 +40,13 @@ Depend on the top-level `devl` facade crate (optionally enabling `candle`, `meta
 ```toml
 # Facade crate (core only by default)
 [dependencies]
-devl = "0.1.0"
+devl = "0.2.0"
 
 # Facade crate with Candle backend (or features = ["metal"] / ["cuda"])
-# devl = { version = "0.1.0", features = ["candle"] }
+# devl = { version = "0.2.0", features = ["candle"] }
 
 # Core protocol only (zero ML dependencies)
-# devl-core = "0.1.0"
+# devl-core = "0.2.0"
 ```
 
 On ARM64 Linux, add the following to your application's workspace root
@@ -148,7 +148,20 @@ rate. A parity mismatch produces the JSON report and a nonzero exit status.
 
 ## Local server
 
-`devl-server` (unpublished, in `crates/devl-server`) serves the streaming
+`devl-server` (in `crates/devl-server`) is distributed as source for v0.2.0.
+It is not published to crates.io (`publish = false`); `devl-core`, `devl-candle`,
+and `devl` are the published crates. Run it from a checkout of the release tag:
+
+```bash
+git clone --branch v0.2.0 https://github.com/njetty/devl-rs.git
+cd devl-rs
+cargo run -p devl-server
+```
+
+`Cargo.lock` is not committed, so dependencies resolve to the newest versions
+allowed by the manifests when you build. Use `cargo install --git
+https://github.com/njetty/devl-rs --tag v0.2.0 devl-server` to install the
+binary instead; `--locked` is not usable. `devl-server` serves the streaming
 contract in [docs/SERVER_CONTRACT.md](https://github.com/njetty/devl-rs/blob/main/docs/SERVER_CONTRACT.md)
 over HTTP and WebSocket from one process. Both listeners share one
 coordinator, so they share one worker pool and one `PriorityScheduler`. It is a
@@ -410,8 +423,8 @@ prepared in the fixture directory at measurement time.
 
 - **Implemented:** `devl-core` (`DevlBackend` trait, `DevlSession` state machine, single-pass verify/rollback/resume loop, `PriorityScheduler` with step-level cooperative preemption, and deterministic `MockBackend` test suite) and the `devl` facade crate.
 - **Implemented:** Local Whisper inference over Candle, deterministic mel extraction, per-layer KV-cache truncation, and local streaming examples.
-- **In progress (`v0.2`):** Qwen3-ASR over Candle. The windowed audio encoder, decoder, and `DevlBackend` integration with reusable audio windows and prefix KV are implemented. Exact greedy token parity with the pinned upstream checkpoint is validated locally on five clips (`f32`, CPU), see `docs/ARCHITECTURE.md` Section 6.16 for scope and limits.
-- **In progress (`v0.2`):** `devl-server`. The transport-neutral streaming contract, per-stream state machine, and the session coordinator that drives per-stream sessions through `PriorityScheduler` and WebSocket and HTTP streaming adapters over that coordinator are implemented (see `docs/SERVER_CONTRACT.md`). Pluggable per-stream VAD/endpointing hooks with a deterministic reference policy are implemented. A local `devl-server` binary selects the mock, Whisper, or Qwen3-ASR backend, and CI plus opt-in real-model smoke tests exercise both transports (see Local server). Hosted deployment, TLS, and authentication are not implemented.
+- **Implemented (`v0.2.0`):** Qwen3-ASR over Candle. The windowed audio encoder, decoder, and `DevlBackend` integration with reusable audio windows and prefix KV are implemented. Exact greedy token parity with the pinned upstream checkpoint is validated locally on five clips (`f32`, CPU), see `docs/ARCHITECTURE.md` Section 6.16 for scope and limits.
+- **Implemented (`v0.2.0`, source-distributed):** `devl-server`. The transport-neutral streaming contract, per-stream state machine, and the session coordinator that drives per-stream sessions through `PriorityScheduler` and WebSocket and HTTP streaming adapters over that coordinator are implemented (see `docs/SERVER_CONTRACT.md`). Pluggable per-stream VAD/endpointing hooks with a deterministic reference policy are implemented. A local `devl-server` binary selects the mock, Whisper, or Qwen3-ASR backend, and CI plus opt-in real-model smoke tests exercise both transports (see Local server). Hosted deployment, TLS, and authentication are not implemented.
 
 ## Contributing
 

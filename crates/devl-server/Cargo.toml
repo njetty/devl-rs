@@ -8,8 +8,9 @@ repository.workspace = true
 readme = "../../README.md"
 keywords = ["asr", "speech-recognition", "streaming", "devl"]
 categories = ["multimedia::audio", "network-programming"]
-# Unpublished until endpoint adapters land; the release workflow publishes the
-# three existing crates only.
+# Source-distributed for v0.2.0 (run from the release tag). `cargo publish
+# --workspace` skips `publish = false` members, so the release workflow publishes
+# devl-core, devl-candle, and devl only.
 publish = false
 
 [features]

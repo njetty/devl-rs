@@ -9,7 +9,7 @@
 //! adapter over the coordinator, with JSON control messages in [`wire`].
 //! The [`http`] module is an HTTP/1.1 adapter over the same coordinator.
 //! The [`endpoint`] module defines optional per-stream VAD and endpointing hooks.
-//! Backend integration is separate work.
+//! Backends are selected by the `devl-server` binary, not by this library.
 //!
 //! Protocol logic (verification, rollback, commit-over-draft scheduling)
 //! stays in `devl-core`. The contract only decides which messages are legal,
