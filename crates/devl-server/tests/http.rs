@@ -740,20 +740,29 @@ fn credit_overrun_is_a_backpressure_violation() {
             initial_credit_samples: 100,
             max_outstanding_credit_samples: 100,
         },
+        draft_cadence_samples: 100,
         ..coordinator_config()
     };
-    let f = fixture_with(MockBackend::new(), cc, HttpConfig::default());
-    let mut c = Client::connect(f.addr());
+    let (entered_tx, entered_rx) = std_mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std_mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let mock = MockBackend::with_transcripts([(100, vec![11, 12, MOCK_EOS_TOKEN])]).with_step_hook(
+        move |_| {
+            let _ = entered_tx.try_send(());
+            let _ = release_rx.lock().unwrap().recv_timeout(WAIT);
+        },
+    );
+    let f = fixture_with(mock, cc, HttpConfig::default());
+    let c = Client::connect(f.addr());
     c.open();
-    // Ignoring `credit` events and sending past the grant must fail rather
-    // than queue unbounded audio.
-    for seq in 0..1_000 {
-        c.send(&audio(seq, 100));
-    }
-    c.end();
-    let v = c.finish();
-    assert_eq!(v["type"], "error", "{v}");
-    assert_eq!(v["code"], "backpressure_violation", "{v}");
+    c.send(&audio(0, 100));
+    entered_rx.recv_timeout(WAIT).expect("draft did not start");
+    assert_eq!(c.expect_type("credit")["samples"], 100);
+    // The draft holds the session, so the pending frame cannot restore credit.
+    c.send(&audio(1, 100));
+    c.send(&audio(2, 1));
+    c.expect_error("backpressure_violation");
+    drop(release_tx);
     f.assert_retired();
 }
 
