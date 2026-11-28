@@ -1,6 +1,6 @@
 [package]
 name = "devl-server"
-description = "Streaming contract, session coordinator, and WebSocket adapter for DEVL servers"
+description = "Streaming contract, session coordinator, and WebSocket and HTTP adapters for DEVL servers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -18,8 +18,13 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tungstenite.workspace = true
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
+hyper = { workspace = true, features = ["http1", "client", "server"] }
+http-body-util.workspace = true
 devl-core = { workspace = true, features = ["test-utils"] }
 
 [lints]

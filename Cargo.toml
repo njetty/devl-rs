@@ -20,6 +20,10 @@ thiserror = "2.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
 candle-core = "0.11"
 candle-nn = "0.11"
 candle-transformers = "0.11"
