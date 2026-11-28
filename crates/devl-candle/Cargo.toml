@@ -1,6 +1,6 @@
 [package]
 name = "devl-candle"
-description = "Candle inference backend for devl-rs (Whisper on CPU, Metal, and CUDA)"
+description = "Candle inference backend for devl-rs (Whisper and Qwen3-ASR)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

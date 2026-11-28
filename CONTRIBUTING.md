@@ -96,6 +96,8 @@ cargo package --list -p devl-candle --allow-dirty
 cargo package --list -p devl --allow-dirty
 ```
 
+Before a release, also confirm the workspace publish selects exactly those three crates: `cargo publish --workspace --dry-run --allow-dirty` (it packages and verifies `devl-core`, `devl-candle`, then `devl`, and skips `devl-server`). On `aarch64-unknown-linux-gnu` the verification build of `devl-candle` needs `RUSTFLAGS="-C target-feature=+fp16"`, because the packaged build does not inherit the workspace `gemm-f16` profile workaround.
+
 On macOS Apple Silicon, also run:
 
 ```bash
@@ -192,7 +194,7 @@ Update documentation in the same pull request as the behavior it changes:
 
 ## Releases
 
-Crates on crates.io (`devl-core`, `devl-candle`, and `devl`) are immutable per version and are never updated automatically on pushes to `main`.
+Crates on crates.io (`devl-core`, `devl-candle`, and `devl`) are immutable per version and are never updated automatically on pushes to `main`. `devl-server` has `publish = false`: it is source-distributed from the release tag and `cargo publish --workspace` skips it.
 
 Maintainers cut a release in two steps:
 
