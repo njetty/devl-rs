@@ -689,6 +689,7 @@ where
             return Ok(input_done);
         }
         tokio::select! {
+            () = run.tx.closed() => return Err(Gone),
             () = tokio::time::sleep_until(deadline) => {
                 run.reject(ErrorCode::Internal, "stream deadline exceeded").await?;
             }
