@@ -1,6 +1,6 @@
 # `devl-server` Streaming Contract
 
-Status: contract version `1.0`, implemented in `crates/devl-server` as types, binary audio framing, limits, and a validating per-stream state machine. The session coordinator (`Coordinator`, `StreamSession`) drives per-stream sessions through `PriorityScheduler`. A synchronous WebSocket adapter (`WsServer`) maps the contract onto connections. HTTP endpoints, backend selection, endpointing, authentication, and deployment are not implemented; see [Boundaries](#boundaries).
+Status: contract version `1.0`, implemented in `crates/devl-server` as types, binary audio framing, limits, and a validating per-stream state machine. The session coordinator (`Coordinator`, `StreamSession`) drives per-stream sessions through `PriorityScheduler`. A synchronous WebSocket adapter (`WsServer`) and an HTTP/1.1 streaming adapter (`HttpServer`) map the contract onto connections. Backend selection, endpointing, authentication, and deployment are not implemented; see [Boundaries](#boundaries).
 
 The contract is transport-neutral. It defines what a client and server may say to each other for one stream, not how bytes travel. Control message serialization is chosen by endpoint adapters; the WebSocket adapter uses JSON (see [WebSocket adapter](#websocket-adapter)). Audio has a defined byte layout.
 
@@ -123,15 +123,15 @@ In this crate (`devl-server`):
 - `Coordinator` and `StreamSession`: a worker pool that owns one `DevlSession` per stream, submits drafts and commits to `PriorityScheduler`, and releases credit. See [Coordinator](#coordinator).
 
 - `WsServer` and the JSON control encoding in `wire`: a WebSocket adapter over the coordinator. See [WebSocket adapter](#websocket-adapter).
+- `HttpServer`: an HTTP/1.1 adapter over the same coordinator. See [HTTP adapter](#http-adapter).
 
 Not in this crate yet, each owned by later issues:
 
-- HTTP endpoint adapter.
 - Backend integration and selection.
 - VAD and endpointing. Today the client decides when to `Commit`.
 - Authentication, TLS, rate limiting, and deployment.
 
-Dependencies: `devl-server` depends on `devl-core` (for `StreamId`), `thiserror`, `serde`, `serde_json`, and `tungstenite` (handshake feature only, blocking I/O) for the WebSocket adapter. It has no async runtime, and `devl-core` is unchanged: protocol ownership, verification, rollback, and commit-over-draft scheduling remain there.
+Dependencies: `devl-server` depends on `devl-core` (for `StreamId`), `thiserror`, `serde`, `serde_json`, `tungstenite` (handshake feature only, blocking I/O) for the WebSocket adapter, and `hyper`, `hyper-util`, and `tokio` for the HTTP adapter, which owns a private runtime. The coordinator and the WebSocket adapter are synchronous and `devl-core` is unchanged: protocol ownership, verification, rollback, and commit-over-draft scheduling remain there.
 
 ## Intended integration
 
@@ -179,3 +179,82 @@ A terminal event is followed by a WebSocket close frame (normal closure) and the
 - Outbound buffering is the coordinator's bounded event queue plus a 64 KiB socket write buffer. A client that stops reading hits `write_timeout` and is disconnected. `write_timeout` bounds each blocking write call, not a whole message or connection.
 - `idle_timeout` closes a connection with no inbound message, except while the stream is committing.
 - `WsServer::shutdown` (also on drop) stops accepting, closes connections with 1001, and joins all adapter threads. The coordinator is shut down separately by its owner.
+
+## HTTP adapter
+
+`HttpServer::bind(addr, Arc<Coordinator>, HttpConfig)` listens on a TCP address and serves one stream per request. HTTP/1.1 parsing, chunked transfer decoding, and connection handling are done by `hyper`; the adapter decides nothing about the stream. It parses upload records, calls `StreamSession::send`, and forwards `try_recv_event` output, exactly as the WebSocket adapter does. It can share one `Coordinator` (and therefore one `PriorityScheduler` and worker pool) with `WsServer`; the `http_and_websocket_share_one_coordinator` test runs both against one coordinator.
+
+### Endpoint
+
+`POST /v1/stream`, HTTP/1.1 only, `Content-Type: application/vnd.devl.stream`. One request is one stream; connections are not reused (`Connection: close`).
+
+| Condition | Response |
+| :--- | :--- |
+| Path other than `/v1/stream` | 404 |
+| Method other than `POST` | 405 with `Allow: POST` |
+| Other `Content-Type` | 415 |
+| HTTP version other than 1.1 | 505 |
+| Open-stream cap reached or coordinator shut down | 503, `internal` error |
+| Accepted | 200, `Content-Type: application/x-ndjson`, chunked body |
+
+Rejections carry a single `error` event line as the body. Once the response is 200, every stream failure is an `error` event in the body, never a different HTTP status.
+
+### Upload framing
+
+The request body is a sequence of records, sent either with `Transfer-Encoding: chunked` (for incremental upload) or a `Content-Length` (for a body known up front). HTTP chunk boundaries carry no meaning: a record may be split across any number of chunks and several records may share one, so a proxy that re-chunks the body does not change the stream.
+
+```text
+record := length:u32le payload
+payload := '{' ...      JSON control message (start, commit, cancel, close)
+         | 0x01 0x01 .. audio envelope (see Audio frame envelope)
+```
+
+- `length` is little-endian and counts the payload only. A zero length is `malformed_frame`.
+- A payload whose first byte is `{` is a JSON control message in the encoding of the WebSocket adapter (`start`, `commit`, `cancel`, `close`). Any other first byte is an audio frame envelope, whose first byte is the protocol major, so a wrong layout version is `unsupported_version`.
+- A record may be at most the larger of one maximal audio frame (`10 + 4 * max_frame_samples` bytes) and `max_text_bytes` (default 16 KiB). The length prefix is checked before the payload is buffered; a larger record is `frame_too_large`. A JSON record over `max_text_bytes` is also `frame_too_large`.
+- Records are processed in order and mapped one to one onto client messages, so every sequencing, limit, and credit rule above applies unchanged.
+
+### Event framing
+
+The response body is newline-delimited JSON: one event per line, in the JSON encoding of the WebSocket adapter (`started`, `credit`, `partial`, `final`, `cancelled`, `error`). The server writes each event as its own HTTP chunk, but clients must split on newlines, not chunk boundaries. The response head and `started` are sent without waiting for the request body to end, and later events are written while the upload continues, so a client that reads and writes concurrently sees `partial` before it sends `commit`. Exactly one terminal event ends the stream; the response body ends after it.
+
+### Lifecycle and input errors
+
+| Situation | Behavior |
+| :--- | :--- |
+| `commit` sent, final produced | `final`, response ends. |
+| `cancel` or `close` before a terminal event | `cancelled`, response ends. |
+| Contract violation (order, sequence, limits, credit) | The coordinator's `error` event, response ends. |
+| Invalid record (bad length, JSON, or envelope) | One `error` event with `malformed_frame`, `unsupported_version`, or `frame_too_large`, then the response ends. |
+| Upload ends cleanly (final chunk) before `commit` or `cancel` | `error` with `invalid_message_order`. After `commit`, the server keeps waiting for the final. |
+| Upload ends cleanly inside a record | `error` with `malformed_frame`. |
+| Connection reset, aborted chunked body, or client stops reading | The stream is released with no event, since there is nobody to tell. |
+| Server shutdown, idle timeout, or stream deadline | `error` with `internal` and a message naming the cause. |
+
+The contract has no dedicated timeout code, so timeouts use `internal`; messages are not stable, so clients should key on the HTTP status and event `type`.
+
+After a terminal event the adapter keeps discarding upload bytes for a short bounded time before ending the response, so a client still uploading usually receives the terminal event instead of a connection reset.
+
+### Bounds
+
+- `max_connections` caps simultaneous connections; extra TCP connections are closed. The coordinator's `max_streams` is separate and reported as 503.
+- `header_timeout` is an absolute deadline for the request head from the first read, so a client dribbling headers cannot hold a slot.
+- `max_body_bytes` (default 128 MiB) caps the total upload; exceeding it is `stream_too_long`. `max_stream_samples` is enforced independently by the contract.
+- `max_stream_duration` (default 15 min) is an absolute deadline from the start of the stream, whatever the client sends. `idle_timeout` bounds inbound silence and does not apply while committing. A hard per-connection backstop also bounds anything the stream task does not cover.
+- Outbound buffering is the coordinator's bounded event queue plus a small channel to the connection. An event that cannot be delivered within `write_timeout` drops the client; this is a per-event bound, not a deadline for the stream.
+- `drain_timeout` and `drain_bytes` bound the post-terminal discard of upload bytes.
+- `HttpServer::shutdown` (also on drop) stops accepting, fails open streams, and stops the runtime after `shutdown_grace`.
+
+### Clients
+
+Any HTTP/1.1 client that can send a chunked request body and read a chunked response while the request is still open can use the endpoint. The tests exercise three: `hyper`'s client (incremental body, incremental response), `curl`, and raw TCP for malformed requests. `curl -T -` reads its standard input with blocking reads and therefore surfaces response lines only when it next reads input, not while idle; use a client that reads and writes concurrently for lowest latency.
+
+To try the endpoint locally with the deterministic mock backend (synthetic tokens, not speech):
+
+```bash
+cargo run -p devl-server --example http_mock_server -- 127.0.0.1:8080
+# in another terminal; sends 3 s of silence, or pass a 16 kHz mono s16le file
+cargo run -p devl-server --example http_stream_client -- 127.0.0.1:8080 [audio.s16le]
+```
+
+`http_stream_client` uploads one frame at a time at roughly real time and prints each event line as it arrives, so `partial` lines appear before `final`. The example server uses a mock backend because model setup is separate work.

@@ -2,12 +2,13 @@
 //!
 //! This crate defines the versioned client/server message vocabulary, the
 //! binary audio framing, the per-stream limits, and a validating per-stream
-//! state machine ([`StreamContract`]). It performs no I/O, owns no async
-//! runtime, and contains no inference or verification logic. The
+//! state machine ([`StreamContract`]). The contract itself performs no I/O and
+//! contains no inference or verification logic. The
 //! [`coordinator`] module owns one `DevlSession` per stream and drives it
 //! through `PriorityScheduler`. The [`ws`] module is a synchronous WebSocket
 //! adapter over the coordinator, with JSON control messages in [`wire`].
-//! HTTP adapters and backend integration are separate work.
+//! The [`http`] module is an HTTP/1.1 adapter over the same coordinator.
+//! Backend integration is separate work.
 //!
 //! Protocol logic (verification, rollback, commit-over-draft scheduling)
 //! stays in `devl-core`. The contract only decides which messages are legal,
@@ -25,6 +26,7 @@ pub mod coordinator;
 pub mod error;
 mod events;
 pub mod frame;
+pub mod http;
 pub mod limits;
 pub mod message;
 pub mod state;
@@ -37,6 +39,7 @@ pub use coordinator::{
 pub use devl_core::StreamId;
 pub use error::{ErrorCode, StreamError};
 pub use frame::{FRAME_HEADER_LEN, decode_audio_frame, decode_samples, encode_audio_frame};
+pub use http::{HttpConfig, HttpServer, RecordDecoder};
 pub use limits::StreamLimits;
 pub use message::{
     AudioFormat, AudioFrame, ClientMessage, PROTOCOL_VERSION, ProtocolVersion, SampleEncoding,

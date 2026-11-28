@@ -77,6 +77,32 @@ pub fn parse_client_message(text: &str) -> Result<ClientMessage, StreamError> {
     })
 }
 
+/// Encode a client control message as JSON, for clients and tests.
+///
+/// Returns `None` for [`ClientMessage::Audio`], which has no JSON form and
+/// travels in the binary envelope of [`crate::frame`].
+pub fn encode_client_message(msg: &ClientMessage) -> Option<String> {
+    let value: Value = match msg {
+        ClientMessage::Start { version, format } => json!({
+            "type": "start",
+            "version": { "major": version.major, "minor": version.minor },
+            "format": {
+                "encoding": match format.encoding {
+                    SampleEncoding::S16Le => "s16le",
+                    SampleEncoding::F32Le => "f32le",
+                },
+                "sample_rate_hz": format.sample_rate_hz,
+                "channels": format.channels,
+            },
+        }),
+        ClientMessage::Audio(_) => return None,
+        ClientMessage::Commit { frames } => json!({ "type": "commit", "frames": frames }),
+        ClientMessage::Cancel => json!({ "type": "cancel" }),
+        ClientMessage::Close => json!({ "type": "close" }),
+    };
+    Some(value.to_string())
+}
+
 /// Encode a server event as a JSON text frame body.
 pub fn encode_server_event(event: &ServerEvent) -> String {
     let value: Value = match event {
@@ -142,6 +168,26 @@ mod tests {
         assert_eq!(
             parse_client_message(r#"{"type":"close"}"#).unwrap(),
             ClientMessage::Close
+        );
+    }
+
+    #[test]
+    fn client_messages_round_trip() {
+        for msg in [
+            ClientMessage::Start {
+                version: PROTOCOL_VERSION,
+                format: AudioFormat::mono_16k_f32(),
+            },
+            ClientMessage::Commit { frames: 7 },
+            ClientMessage::Cancel,
+            ClientMessage::Close,
+        ] {
+            let text = encode_client_message(&msg).unwrap();
+            assert_eq!(parse_client_message(&text).unwrap(), msg);
+        }
+        assert!(
+            encode_client_message(&ClientMessage::Audio(crate::AudioFrame::from_s16(0, &[1])))
+                .is_none()
         );
     }
 

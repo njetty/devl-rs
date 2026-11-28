@@ -41,9 +41,9 @@ DEVL converts offline speech recognition models into low-latency streaming recog
   - Owns model loading, deterministic audio feature extraction, device placement, KV-cache management/truncation, and the `DevlBackend` implementation for local Whisper inference.
   - Must not re-implement prefix verification, rollback selection, draft loop orchestration, or commit-over-draft scheduling; all protocol logic lives in `devl-core`.
 - **`crates/devl-server`** (unpublished):
-  - Depends on `devl-core` and `thiserror` only. No async runtime, networking, or backend dependencies (`devl-core` with `test-utils` is a dev-dependency for tests).
-  - Owns the versioned streaming contract (message vocabulary, audio framing, limits, backpressure, cancellation), a validating per-stream state machine, and the session coordinator that owns one `DevlSession` per stream and drives it through `PriorityScheduler` on a bounded worker pool. See [SERVER_CONTRACT.md](SERVER_CONTRACT.md).
-  - Planned, not implemented: endpoint adapters, backend selection, VAD/endpointing hooks, and telemetry. It must not duplicate verification, rollback, or scheduling logic from `devl-core`.
+  - Depends on `devl-core`, `thiserror`, `serde`/`serde_json`, `tungstenite` (blocking WebSocket), and `hyper`/`hyper-util`/`tokio` (HTTP adapter, private runtime). No backend dependencies (`devl-core` with `test-utils` is a dev-dependency for tests). Networking and the async runtime stay in this crate; `devl-core` has neither.
+  - Owns the versioned streaming contract (message vocabulary, audio framing, limits, backpressure, cancellation), a validating per-stream state machine, and the session coordinator that owns one `DevlSession` per stream and drives it through `PriorityScheduler` on a bounded worker pool. WebSocket and HTTP adapters are transports over that one coordinator; neither runs its own session engine. See [SERVER_CONTRACT.md](SERVER_CONTRACT.md).
+  - Planned, not implemented: backend selection, VAD/endpointing hooks, and telemetry. It must not duplicate verification, rollback, or scheduling logic from `devl-core`.
 
 ---
 

@@ -781,7 +781,7 @@ fn queued_cancellations_cannot_accumulate_behind_a_busy_worker() {
     assert!(c.open_stream().is_ok());
     gate.release();
     drop(a);
-    wait_open_streams(&c, 1);
+    wait_open_streams(&c, 0);
     assert_eq!(c.stats().active_commits, 0);
     c.shutdown();
     assert_eq!(live.load(Ordering::SeqCst), 1);
