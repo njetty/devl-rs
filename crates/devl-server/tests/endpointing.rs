@@ -322,13 +322,13 @@ fn disconnect_and_cancel_drop_the_policy_without_events() {
     s.send(&speech(0)).unwrap();
     s.send(&ClientMessage::Cancel).unwrap();
     assert_eq!(until_terminal(&s).last(), Some(&ServerEvent::Cancelled));
-    drop(s);
-    assert_clean(&c);
     assert_eq!(
         dropped.load(Ordering::SeqCst),
         2,
-        "each stream owns and drops its policy"
+        "terminated streams release policies even while a handle is retained"
     );
+    drop(s);
+    assert_clean(&c);
 }
 
 #[test]

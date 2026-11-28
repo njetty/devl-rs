@@ -472,7 +472,6 @@ where
                 // The contract arbitrates: an automatic end of turn commits only
                 // from `Streaming`, the same transition a client `Commit` makes.
                 if decision == EndpointDecision::EndTurn && st.contract.begin_auto_commit() {
-                    st.policy = None;
                     self.start_commit_locked(&mut st);
                 } else if (st.samples_since_draft >= self.ctx.config.draft_cadence_samples
                     || decision == EndpointDecision::Checkpoint)
@@ -535,6 +534,7 @@ where
 
     fn finish_locked(&self, st: &mut StreamState) {
         st.done = true;
+        st.policy = None;
         st.pending = Vec::new();
         self.closed.store(true, Ordering::Release);
     }
