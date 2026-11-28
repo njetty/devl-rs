@@ -251,7 +251,7 @@ prepared in the fixture directory at measurement time.
 - **Implemented:** `devl-core` (`DevlBackend` trait, `DevlSession` state machine, single-pass verify/rollback/resume loop, `PriorityScheduler` with step-level cooperative preemption, and deterministic `MockBackend` test suite) and the `devl` facade crate.
 - **Implemented:** Local Whisper inference over Candle, deterministic mel extraction, per-layer KV-cache truncation, and local streaming examples.
 - **In progress (`v0.2`):** Qwen3-ASR over Candle. The windowed audio encoder, decoder, and `DevlBackend` integration with reusable audio windows and prefix KV are implemented. Exact greedy token parity with the pinned upstream checkpoint is validated locally on five clips (`f32`, CPU), see `docs/ARCHITECTURE.md` Section 6.16 for scope and limits.
-- **In progress (`v0.2`):** `devl-server`. The transport-neutral streaming contract, per-stream state machine, and the session coordinator that drives per-stream sessions through `PriorityScheduler` and WebSocket and HTTP streaming adapters over that coordinator are implemented (see `docs/SERVER_CONTRACT.md`). Planned: VAD/endpointing hooks.
+- **In progress (`v0.2`):** `devl-server`. The transport-neutral streaming contract, per-stream state machine, and the session coordinator that drives per-stream sessions through `PriorityScheduler` and WebSocket and HTTP streaming adapters over that coordinator are implemented (see `docs/SERVER_CONTRACT.md`). Pluggable per-stream VAD/endpointing hooks with a deterministic reference policy are implemented; backend selection is planned.
 
 ## Contributing
 

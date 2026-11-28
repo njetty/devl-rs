@@ -8,6 +8,7 @@
 //! through `PriorityScheduler`. The [`ws`] module is a synchronous WebSocket
 //! adapter over the coordinator, with JSON control messages in [`wire`].
 //! The [`http`] module is an HTTP/1.1 adapter over the same coordinator.
+//! The [`endpoint`] module defines optional per-stream VAD and endpointing hooks.
 //! Backend integration is separate work.
 //!
 //! Protocol logic (verification, rollback, commit-over-draft scheduling)
@@ -23,6 +24,7 @@
 )]
 
 pub mod coordinator;
+pub mod endpoint;
 pub mod error;
 mod events;
 pub mod frame;
@@ -37,6 +39,10 @@ pub use coordinator::{
     Coordinator, CoordinatorConfig, CoordinatorError, CoordinatorStats, Detokenizer, StreamSession,
 };
 pub use devl_core::StreamId;
+pub use endpoint::{
+    EndpointConfigError, EndpointDecision, EndpointPolicy, EndpointPolicyFactory,
+    SilenceEndpointConfig, SilenceEndpointPolicy,
+};
 pub use error::{ErrorCode, StreamError};
 pub use frame::{FRAME_HEADER_LEN, decode_audio_frame, decode_samples, encode_audio_frame};
 pub use http::{HttpConfig, HttpServer, RecordDecoder};

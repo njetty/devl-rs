@@ -1,6 +1,6 @@
 # `devl-server` Streaming Contract
 
-Status: contract version `1.0`, implemented in `crates/devl-server` as types, binary audio framing, limits, and a validating per-stream state machine. The session coordinator (`Coordinator`, `StreamSession`) drives per-stream sessions through `PriorityScheduler`. A synchronous WebSocket adapter (`WsServer`) and an HTTP/1.1 streaming adapter (`HttpServer`) map the contract onto connections. Backend selection, endpointing, authentication, and deployment are not implemented; see [Boundaries](#boundaries).
+Status: contract version `1.0`, implemented in `crates/devl-server` as types, binary audio framing, limits, and a validating per-stream state machine. The session coordinator (`Coordinator`, `StreamSession`) drives per-stream sessions through `PriorityScheduler`. A synchronous WebSocket adapter (`WsServer`) and an HTTP/1.1 streaming adapter (`HttpServer`) map the contract onto connections. Optional server-side endpointing is implemented as hooks (see [Endpointing](#endpointing)). Backend selection, authentication, and deployment are not implemented; see [Boundaries](#boundaries).
 
 The contract is transport-neutral. It defines what a client and server may say to each other for one stream, not how bytes travel. Control message serialization is chosen by endpoint adapters; the WebSocket adapter uses JSON (see [WebSocket adapter](#websocket-adapter)). Audio has a defined byte layout.
 
@@ -122,13 +122,13 @@ In this crate (`devl-server`):
 - `StreamContract`, a state machine with no I/O that validates client messages (`receive`) and server events (`emit`).
 - `Coordinator` and `StreamSession`: a worker pool that owns one `DevlSession` per stream, submits drafts and commits to `PriorityScheduler`, and releases credit. See [Coordinator](#coordinator).
 
+- `EndpointPolicy` hooks and a deterministic reference policy. See [Endpointing](#endpointing).
 - `WsServer` and the JSON control encoding in `wire`: a WebSocket adapter over the coordinator. See [WebSocket adapter](#websocket-adapter).
 - `HttpServer`: an HTTP/1.1 adapter over the same coordinator. See [HTTP adapter](#http-adapter).
 
 Not in this crate yet, each owned by later issues:
 
 - Backend integration and selection.
-- VAD and endpointing. Today the client decides when to `Commit`.
 - Authentication, TLS, rate limiting, and deployment.
 
 Dependencies: `devl-server` depends on `devl-core` (for `StreamId`), `thiserror`, `serde`, `serde_json`, `tungstenite` (handshake feature only, blocking I/O) for the WebSocket adapter, and `hyper`, `hyper-util`, and `tokio` for the HTTP adapter, which owns a private runtime. The coordinator and the WebSocket adapter are synchronous and `devl-core` is unchanged: protocol ownership, verification, rollback, and commit-over-draft scheduling remain there.
@@ -156,6 +156,29 @@ Checkpoint cadence matters because encoding and verification run before the firs
 - **Teardown.** Cancel, close, disconnect (dropping the handle), final, error, and shutdown clear pending audio, remove the stream's queued jobs with `PriorityScheduler::cancel_stream`, drop the session (the worker does so if mid-job), and only then free the stream slot. A stream whose job is executing keeps its slot until the worker retires, so open-stream admission bounds queued and running work: with a worker gated on one stream, repeated open, commit, cancel, and reopen cannot grow the queues beyond the cap. An uncancellable running commit can therefore delay slot reuse until it returns. Pending `Partial` events are discarded when a terminal event is queued, and messages sent after the terminal event schedule nothing. Job permits are RAII and release on every path including panics, which fail only the affected stream with `internal`. Scheduler metadata for a stream is dropped when its last draft stops.
 - **Shutdown.** `Coordinator::shutdown` stops admission, fails open streams with `internal`, and joins the workers. `DevlSession::commit` has no preemption hook, so a commit already running finishes and its result is discarded. The same applies to a commit-phase `Cancel`.
 - **Draft errors.** A backend error inside a draft is non-fatal and emits nothing; the commit pass re-runs the work and reports any persistent failure.
+
+## Endpointing
+
+`Coordinator::with_endpointing(backend, detokenizer, config, factory)` installs a per-stream `EndpointPolicy`. `Coordinator::new` installs none: the client decides when to `Commit` and drafts follow `draft_cadence_samples`, unchanged. The hook lives in `devl-server`; `devl-core` is unaffected, and adapters need no change because they forward events and observe the phase as before.
+
+```rust
+pub trait EndpointPolicy: Send {
+    fn on_audio(&mut self, frame: &[f32], total_samples: u64) -> EndpointDecision;
+}
+enum EndpointDecision { Continue, Checkpoint, EndTurn }
+```
+
+- **Per-stream state.** The factory is called once per opened stream (with its `StreamId`) and the instance is owned by that stream. It is dropped on final, cancel, error, disconnect, and shutdown. There is no reset; a new turn is a new stream.
+- **Invocation.** `on_audio` runs once per accepted audio frame, in order, under the stream's state lock on the sending thread. It must not block. A panic fails the stream with `internal`. Resolution is one frame: a turn cannot end mid-frame, and the frame that ends it belongs to the turn. Policies see decoded mono `f32` samples at 16 kHz and may count samples but have no clock, which keeps them deterministic.
+- **Checkpoint.** `Checkpoint` submits a draft in addition to cadence drafts and resets the cadence counter. Drafts remain advisory: the scheduler coalesces them and the partial staleness rules apply.
+- **EndTurn.** The coordinator moves the contract from `Streaming` to `Committing`, the same transition an accepted client `Commit` makes, then submits the final through `submit_commit`, so queued drafts are evicted and a running draft is preempted and its partial suppressed. `EndTurn` wins over `Checkpoint` for a frame.
+- **Exactly one final.** Every trigger goes through the contract's phase transition under one lock, so only one can move `Streaming` to `Committing`. A manual `Commit` that arrives after an automatic end of turn, and any `Audio` that was in flight, are ignored rather than errors, because the client could not have known. The final covers exactly the audio accepted before the end of turn, and `Final.audio_samples` still equals the audio received. Audio or `Commit` after a manual commit remain `invalid_message_order`, as before. Concurrent triggers from different threads therefore yield at most one `Final`; a client whose own messages race its own commit can still receive `Error` instead.
+- **Cancel.** `Cancel` and `Close` during an automatic commit behave as in [Cancellation](#cancellation).
+- **Event order.** `Started`, then `Credit` and `Partial` events (partials only before the commit), then one terminal event.
+
+`SilenceEndpointPolicy` is the reference policy: a frame is speech if its peak absolute sample is at least `speech_threshold`. Silence before the first speech is ignored, so silence-only audio never ends the turn. After speech, silence reaching `checkpoint_silence_samples` requests one checkpoint per pause (speech re-arms it) and silence reaching `end_silence_samples` ends the turn. `max_turn_samples` ends the turn from stream start, speech or not, which bounds long turns before `max_stream_samples`. It is a test and reference implementation, not a production VAD; production models are out of scope.
+
+Limits: one turn per stream and one automatic end of turn; resolution is a frame (up to `max_frame_samples`); policies cannot emit text or alter audio; an automatic end of turn that races the client may still reach a client that sends more audio, which the server then ignores until the terminal event is delivered.
 
 ## WebSocket adapter
 

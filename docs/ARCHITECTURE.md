@@ -43,7 +43,7 @@ DEVL converts offline speech recognition models into low-latency streaming recog
 - **`crates/devl-server`** (unpublished):
   - Depends on `devl-core`, `thiserror`, `serde`/`serde_json`, `tungstenite` (blocking WebSocket), and `hyper`/`hyper-util`/`tokio` (HTTP adapter, private runtime). No backend dependencies (`devl-core` with `test-utils` is a dev-dependency for tests). Networking and the async runtime stay in this crate; `devl-core` has neither.
   - Owns the versioned streaming contract (message vocabulary, audio framing, limits, backpressure, cancellation), a validating per-stream state machine, and the session coordinator that owns one `DevlSession` per stream and drives it through `PriorityScheduler` on a bounded worker pool. WebSocket and HTTP adapters are transports over that one coordinator; neither runs its own session engine. See [SERVER_CONTRACT.md](SERVER_CONTRACT.md).
-  - Planned, not implemented: backend selection, VAD/endpointing hooks, and telemetry. It must not duplicate verification, rollback, or scheduling logic from `devl-core`.
+  - Implemented: pluggable per-stream VAD/endpointing hooks (`EndpointPolicy`), applied by the coordinator through the same contract transition as a client `Commit`. Planned, not implemented: backend selection and telemetry. It must not duplicate verification, rollback, or scheduling logic from `devl-core`.
 
 ---
 
