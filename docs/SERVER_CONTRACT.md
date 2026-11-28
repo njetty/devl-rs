@@ -273,16 +273,6 @@ After a terminal event the adapter keeps discarding upload bytes for a short bou
 
 Any HTTP/1.1 client that can send a chunked request body and read a chunked response while the request is still open can use the endpoint. The tests exercise three: `hyper`'s client (incremental body, incremental response), `curl`, and raw TCP for malformed requests. `curl -T -` reads its standard input with blocking reads and therefore surfaces response lines only when it next reads input, not while idle; use a client that reads and writes concurrently for lowest latency.
 
-To try the endpoint locally with the deterministic mock backend (synthetic tokens, not speech):
-
-```bash
-cargo run -p devl-server --example http_mock_server -- 127.0.0.1:8080
-# in another terminal; sends 3 s of silence, or pass a 16 kHz mono s16le file
-cargo run -p devl-server --example http_stream_client -- 127.0.0.1:8080 [audio.s16le]
-```
-
-`http_stream_client` uploads one frame at a time at roughly real time and prints each event line as it arrives, so `partial` lines appear before `final`. The example server uses a mock backend because model setup is separate work.
-
 ## Local server
 
 `cargo run -p devl-server` starts one `Coordinator` and serves the HTTP and WebSocket adapters on it. It selects a backend (`mock`, or `whisper` and `qwen3-asr` with `--features candle`), optionally installs `SilenceEndpointPolicy`, prints the bound addresses on stdout, and stops when stdin closes. The `stream_client` example is a blocking reference client for both transports that respects audio credit. Usage, model setup, and supported limits are in the repository README.

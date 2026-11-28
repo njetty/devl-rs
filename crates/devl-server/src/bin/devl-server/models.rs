@@ -58,7 +58,7 @@ pub fn coordinator_config(
         scheduler: SchedulerConfig::default(),
         session,
         limits,
-        draft_cadence_samples: draft_cadence_ms * SAMPLE_RATE_HZ / 1_000,
+        draft_cadence_samples: draft_cadence_ms * (SAMPLE_RATE_HZ / 1_000),
         max_streams,
     }
 }

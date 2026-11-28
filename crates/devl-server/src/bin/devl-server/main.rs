@@ -12,7 +12,7 @@
 
 mod models;
 
-use std::io::{Read, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -90,19 +90,29 @@ fn parse_args() -> Result<Option<Args>> {
             "--ws" => args.ws = addr(value()?),
             "--workers" => args.workers = value()?.parse()?,
             "--max-streams" => args.max_streams = value()?.parse()?,
-            "--draft-cadence-ms" => args.draft_cadence_ms = value()?.parse()?,
-            "--end-silence-ms" => args.end_silence_ms = Some(value()?.parse()?),
-            "--checkpoint-silence-ms" => args.checkpoint_silence_ms = Some(value()?.parse()?),
+            "--draft-cadence-ms" => args.draft_cadence_ms = duration_ms(&flag, &value()?)?,
+            "--end-silence-ms" => args.end_silence_ms = Some(duration_ms(&flag, &value()?)?),
+            "--checkpoint-silence-ms" => {
+                args.checkpoint_silence_ms = Some(duration_ms(&flag, &value()?)?)
+            }
             "--speech-threshold" => args.speech_threshold = value()?.parse()?,
-            "--max-turn-ms" => args.max_turn_ms = Some(value()?.parse()?),
+            "--max-turn-ms" => args.max_turn_ms = Some(duration_ms(&flag, &value()?)?),
             other => return Err(format!("unknown option {other}\n\n{USAGE}").into()),
         }
     }
     Ok(Some(args))
 }
 
+fn duration_ms(flag: &str, value: &str) -> Result<u64> {
+    let ms: u64 = value.parse()?;
+    if ms > u64::MAX / (SAMPLE_RATE_HZ / 1_000) {
+        return Err(format!("{flag} is too large").into());
+    }
+    Ok(ms)
+}
+
 fn ms_to_samples(ms: u64) -> u64 {
-    ms * SAMPLE_RATE_HZ / 1_000
+    ms * (SAMPLE_RATE_HZ / 1_000)
 }
 
 fn serve<B>(
@@ -159,8 +169,7 @@ where
     out.flush()?;
     drop(out);
 
-    let mut sink = Vec::new();
-    let _ = std::io::stdin().read_to_end(&mut sink);
+    let stdin_result = io::copy(&mut io::stdin().lock(), &mut io::sink());
     if let Some(s) = &http {
         s.shutdown();
     }
@@ -168,6 +177,7 @@ where
         s.shutdown();
     }
     coordinator.shutdown();
+    stdin_result?;
     Ok(())
 }
 

@@ -57,7 +57,7 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
             "--no-commit" => replay.commit = false,
             "--frame-ms" => {
                 let ms: usize = it.next().ok_or("--frame-ms needs a value")?.parse()?;
-                replay.frame_samples = ms * 16;
+                replay.frame_samples = ms.checked_mul(16).ok_or("--frame-ms is too large")?;
             }
             other if other.starts_with("--") => {
                 return Err(format!("unknown option {other}").into());

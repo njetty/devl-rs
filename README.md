@@ -172,7 +172,7 @@ cargo run -p devl-server --example stream_client -- \
   --transport ws --addr 127.0.0.1:8081 clip.wav
 ```
 
-`stream_client` prints every server event as one JSON line (`started`,
+After replay, `stream_client` prints the collected server events as JSON lines (`started`,
 `credit`, `partial`, then one `final`, `cancelled`, or `error`) and exits
 nonzero unless the stream ends with `final`. It respects audio credit.
 `--realtime` paces frames at real time, `--frame-ms <ms>` sets the frame size
