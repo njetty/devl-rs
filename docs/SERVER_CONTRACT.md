@@ -1,6 +1,6 @@
 # `devl-server` Streaming Contract
 
-Status: contract version `1.0`, implemented in `crates/devl-server` as types, binary audio framing, limits, and a validating per-stream state machine. The session coordinator (`Coordinator`, `StreamSession`) drives per-stream sessions through `PriorityScheduler`. A synchronous WebSocket adapter (`WsServer`) and an HTTP/1.1 streaming adapter (`HttpServer`) map the contract onto connections. Optional server-side endpointing is implemented as hooks (see [Endpointing](#endpointing)). Backend selection, authentication, and deployment are not implemented; see [Boundaries](#boundaries).
+Status: contract version `1.0`, implemented in `crates/devl-server` as types, binary audio framing, limits, and a validating per-stream state machine. The session coordinator (`Coordinator`, `StreamSession`) drives per-stream sessions through `PriorityScheduler`. A synchronous WebSocket adapter (`WsServer`) and an HTTP/1.1 streaming adapter (`HttpServer`) map the contract onto connections. Optional server-side endpointing is implemented as hooks (see [Endpointing](#endpointing)). A local `devl-server` binary selects the backend and serves both adapters (see [Local server](#local-server)). Authentication, TLS, and hosted deployment are not implemented; see [Boundaries](#boundaries).
 
 The contract is transport-neutral. It defines what a client and server may say to each other for one stream, not how bytes travel. Control message serialization is chosen by endpoint adapters; the WebSocket adapter uses JSON (see [WebSocket adapter](#websocket-adapter)). Audio has a defined byte layout.
 
@@ -126,12 +126,13 @@ In this crate (`devl-server`):
 - `WsServer` and the JSON control encoding in `wire`: a WebSocket adapter over the coordinator. See [WebSocket adapter](#websocket-adapter).
 - `HttpServer`: an HTTP/1.1 adapter over the same coordinator. See [HTTP adapter](#http-adapter).
 
-Not in this crate yet, each owned by later issues:
+- A local `devl-server` binary and a reference `stream_client` example. See [Local server](#local-server).
 
-- Backend integration and selection.
-- Authentication, TLS, rate limiting, and deployment.
+Not in this crate:
 
-Dependencies: `devl-server` depends on `devl-core` (for `StreamId`), `thiserror`, `serde`, `serde_json`, `tungstenite` (handshake feature only, blocking I/O) for the WebSocket adapter, and `hyper`, `hyper-util`, and `tokio` for the HTTP adapter, which owns a private runtime. The coordinator and the WebSocket adapter are synchronous and `devl-core` is unchanged: protocol ownership, verification, rollback, and commit-over-draft scheduling remain there.
+- Authentication, TLS, rate limiting, and hosted deployment.
+
+Dependencies: `devl-server` depends on `devl-core` (for `StreamId`), `thiserror`, `serde`, `serde_json`, `tungstenite` (handshake feature only, blocking I/O) for the WebSocket adapter, and `hyper`, `hyper-util`, and `tokio` for the HTTP adapter, which owns a private runtime. With the optional `candle` feature the binary and the opt-in smoke test also use `devl-candle`, `candle-*`, and `tokenizers`; the library does not. The coordinator and the WebSocket adapter are synchronous and `devl-core` is unchanged: protocol ownership, verification, rollback, and commit-over-draft scheduling remain there.
 
 ## Intended integration
 
@@ -281,3 +282,14 @@ cargo run -p devl-server --example http_stream_client -- 127.0.0.1:8080 [audio.s
 ```
 
 `http_stream_client` uploads one frame at a time at roughly real time and prints each event line as it arrives, so `partial` lines appear before `final`. The example server uses a mock backend because model setup is separate work.
+
+## Local server
+
+`cargo run -p devl-server` starts one `Coordinator` and serves the HTTP and WebSocket adapters on it. It selects a backend (`mock`, or `whisper` and `qwen3-asr` with `--features candle`), optionally installs `SilenceEndpointPolicy`, prints the bound addresses on stdout, and stops when stdin closes. The `stream_client` example is a blocking reference client for both transports that respects audio credit. Usage, model setup, and supported limits are in the repository README.
+
+Server-side limits applied per backend: Whisper streams are capped at 30 s of audio and Qwen3-ASR streams at the backend's 120 s default, replacing the 5 min default `max_stream_samples`. The binary has no TLS, authentication, or rate limiting.
+
+### Test coverage
+
+- `tests/e2e_smoke.rs` runs in CI. It starts the real binary with the mock backend and checks, for both transports against one server: final text equal to the backend's offline decode, split frames, disconnect followed by reuse of the only stream slot, a `sequence_violation` error followed by a clean stream, endpointing without a client `commit`, and shutdown when stdin closes.
+- `tests/real_model_smoke.rs` is opt-in (`#[ignore]`, feature `candle`). For Whisper and the pinned Qwen3-ASR checkpoint it compares the final token ids of a direct `DevlSession` with the ids behind the `final` event of an HTTP stream and of a WebSocket stream over identical PCM and session settings. The wire carries text only, so the ids are read at the coordinator's detokenizer, and the test requires that the final text map to exactly the direct session's ids. Procedure: README, "CI and real-model smoke checks".
