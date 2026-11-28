@@ -12,8 +12,27 @@ categories = ["multimedia::audio", "network-programming"]
 # three existing crates only.
 publish = false
 
+[features]
+default = ["mock"]
+# Deterministic `MockBackend` for the local `devl-server` binary and CI smoke tests.
+mock = ["devl-core/test-utils"]
+# Local Whisper and Qwen3-ASR backends for the `devl-server` binary and the
+# opt-in real-model smoke test. Not needed by the library.
+candle = [
+    "dep:devl-candle",
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+]
+
 [dependencies]
 devl-core.workspace = true
+devl-candle = { workspace = true, optional = true }
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+candle-transformers = { workspace = true, optional = true }
+tokenizers = { version = "0.23", optional = true }
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,6 +45,17 @@ tokio.workspace = true
 hyper = { workspace = true, features = ["http1", "client", "server"] }
 http-body-util.workspace = true
 devl-core = { workspace = true, features = ["test-utils"] }
+
+[[bin]]
+name = "devl-server"
+path = "src/bin/devl-server/main.rs"
+
+[[example]]
+name = "stream_client"
+
+[[test]]
+name = "real_model_smoke"
+required-features = ["candle"]
 
 [lints]
 workspace = true

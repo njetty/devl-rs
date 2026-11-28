@@ -43,6 +43,9 @@ jobs:
       - name: Run clippy (devl with candle and test-utils)
         run: cargo clippy -p devl --all-targets --features candle,test-utils -- -D warnings
 
+      - name: Run clippy (devl-server with candle)
+        run: cargo clippy -p devl-server --all-targets --features candle -- -D warnings
+
       - name: Check rustdoc
         env:
           RUSTDOCFLAGS: -D warnings

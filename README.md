@@ -146,6 +146,166 @@ count), nearest-rank p99, accepted tokens divided by total verified draft
 tokens (`null` when no draft tokens were verified), and exact token-match
 rate. A parity mismatch produces the JSON report and a nonzero exit status.
 
+## Local server
+
+`devl-server` (unpublished, in `crates/devl-server`) serves the streaming
+contract in [docs/SERVER_CONTRACT.md](https://github.com/njetty/devl-rs/blob/main/docs/SERVER_CONTRACT.md)
+over HTTP and WebSocket from one process. Both listeners share one
+coordinator, so they share one worker pool and one `PriorityScheduler`. It is a
+local development and smoke-test server: no TLS, authentication, or rate
+limiting, and no hosted deployment or availability guarantee.
+
+### Quick start with the mock backend
+
+The default backend is the deterministic `MockBackend`. Its tokens are
+synthetic, so the transcript is a list of token ids, not speech. It needs no
+model files and runs in CI.
+
+```bash
+# Terminal 1: HTTP on :8080, WebSocket on :8081. Close stdin (Ctrl-D) to stop.
+cargo run -p devl-server
+
+# Terminal 2: any mono 16 kHz signed 16-bit WAV, or raw little-endian s16 samples.
+cargo run -p devl-server --example stream_client -- \
+  --transport http --addr 127.0.0.1:8080 clip.wav
+cargo run -p devl-server --example stream_client -- \
+  --transport ws --addr 127.0.0.1:8081 clip.wav
+```
+
+After replay, `stream_client` prints the collected server events as JSON lines (`started`,
+`credit`, `partial`, then one `final`, `cancelled`, or `error`) and exits
+nonzero unless the stream ends with `final`. It respects audio credit.
+`--realtime` paces frames at real time, `--frame-ms <ms>` sets the frame size
+(default 500), and `--no-commit` leaves the end of the turn to server
+endpointing. Pass port `0` to `--http` and `--ws` to let the OS pick ports; the
+server prints the bound addresses (`ready`, `http`, and `ws` lines) on stdout.
+
+### Real models
+
+Real backends need the `candle` feature and local checkpoints. Weights and
+audio are never committed or packaged.
+
+```bash
+# Whisper (openai/whisper-tiny.en layout: config.json, model.safetensors, tokenizer.json)
+cargo run --release -p devl-server --features candle -- \
+  --backend whisper --model /path/to/whisper-tiny.en
+
+# Qwen3-ASR: the pinned revision only (see docs/ARCHITECTURE.md Section 6.1 and 6.7)
+cargo run --release -p devl-server --features candle -- \
+  --backend qwen3-asr --model /path/to/Qwen3-ASR-1.7B
+```
+
+Both run F32 on the CPU. Whisper reads `--tokenizer` (default
+`<model>/tokenizer.json`) for transcript text and accepts at most 30 s of
+audio per stream; the server enforces that as the stream sample limit. The
+Qwen3-ASR snapshot must be `Qwen/Qwen3-ASR-1.7B` at revision
+`7278e1e70fe206f11671096ffdd38061171dd6e5`, downloaded with
+`huggingface_hub.snapshot_download(..., revision=..., local_dir=...)`. The
+loader rejects other shard sizes, and the shard sha256 values are listed in
+`docs/ARCHITECTURE.md` Section 6.1. Its text comes from the snapshot's
+`vocab.json` and `merges.txt`, decodes only the ids after the checkpoint's
+`<asr_text>` marker, and drops the `language ...` header. The stream sample
+limit is the backend's 120 s default (`DEFAULT_MAX_AUDIO_SAMPLES`). Other
+Qwen3-ASR checkpoints and revisions are unsupported. The Qwen3-ASR tokenizer
+path was checked only on the clips listed in the pull request that added it.
+
+### Server options
+
+| Option | Default | Meaning |
+| :--- | :--- | :--- |
+| `--backend` | `mock` | `mock`, `whisper`, or `qwen3-asr` (the last two need `--features candle`). |
+| `--model`, `--tokenizer` | none | Checkpoint directory and optional Whisper `tokenizer.json`. |
+| `--http`, `--ws` | `127.0.0.1:8080`, `127.0.0.1:8081` | Listen addresses; `off` disables a listener. |
+| `--workers`, `--max-streams` | 2, 8 | Inference workers and simultaneous streams. Extra streams get an `internal` error ("stream limit reached"); HTTP answers 503. |
+| `--draft-cadence-ms` | 2000 | Audio between checkpoint drafts. |
+
+Feature flags of the `devl-server` crate: `mock` (default; enables
+`devl-core/test-utils` for the mock backend) and `candle` (Whisper and
+Qwen3-ASR backends, tokenizers). The library itself needs neither.
+`metal` and `cuda` are not exposed by `devl-server`; the smoke path was run on
+the CPU only.
+
+### Transports
+
+- **HTTP:** `POST /v1/stream`, `Content-Type: application/vnd.devl.stream`,
+  one stream per request. The request body is chunked length-prefixed records
+  (JSON control messages and binary audio frames); the response is a chunked
+  `application/x-ndjson` event stream that starts before the upload ends. HTTP/1.1
+  only, one stream per connection. Use `stream_client` or the record encoders in
+  `devl_server::http`; hand-building the length-prefixed body is impractical.
+- **WebSocket:** `ws://host:port`, JSON text frames for control messages and
+  events, binary frames for audio (`docs/SERVER_CONTRACT.md`, "Audio frame
+  envelope"). One stream per connection.
+
+Audio is 16 kHz mono, signed 16-bit (`s16le`) or `f32le`. A client sends
+`start`, audio frames within the granted credit, then `commit` with the frame
+count, and receives one `final`. A dropped connection releases the stream
+without events.
+
+### Endpointing
+
+By default the client decides when to `commit`. With `--end-silence-ms <ms>`
+the server installs `SilenceEndpointPolicy` per stream: after speech, that much
+trailing silence ends the turn and produces the final without a client commit.
+Related options: `--speech-threshold <peak>` (default 0.01, peak absolute
+sample in 0 to 1 that counts as speech), `--checkpoint-silence-ms <ms>` (request
+an extra draft after a pause), and `--max-turn-ms <ms>` (end the turn after that
+much audio). Resolution is one audio frame, so the end of the turn is detected
+at a frame boundary. This reference policy is not a production voice activity
+detector. Example, using `--no-commit` on the client:
+
+```bash
+cargo run -p devl-server -- --end-silence-ms 700
+cargo run -p devl-server --example stream_client -- \
+  --transport ws --addr 127.0.0.1:8081 --no-commit clip_with_trailing_silence.wav
+```
+
+### Supported limits
+
+- One utterance per stream and one stream per connection. Multiple utterances
+  need multiple streams.
+- Per-stream defaults: 2 s frames, 10 s of audio credit, 300 s of audio.
+  Whisper is capped at 30 s and Qwen3-ASR at 120 s by the server.
+- Backends: Whisper (`tiny.en` was exercised) and the pinned Qwen3-ASR-1.7B
+  revision, F32 on the CPU. Metal, CUDA, and other dtypes are not covered by
+  the server smoke path.
+- Loopback and trusted networks only. TLS, authentication, and rate limiting
+  are not implemented.
+- Real-model transcripts through the server were checked on the clips named in
+  the pull request that added the smoke test, not on a corpus. This is not an
+  accuracy or latency claim.
+
+### CI and real-model smoke checks
+
+CI runs `crates/devl-server/tests/e2e_smoke.rs`, which starts the real
+`devl-server` binary with the mock backend and drives both transports with the
+reference client: finalization against the backend's offline decode, split
+frames, disconnect and slot reuse, a protocol error, endpointing without a
+client commit, and clean shutdown. Per-adapter edge cases stay in
+`tests/http.rs` and `tests/websocket.rs`.
+
+The real-model checks are opt-in and `#[ignore]`d. Each loads one checkpoint,
+computes the final tokens of a direct `DevlSession` over a clip, streams the
+identical PCM and session settings through loopback `HttpServer` and
+`WsServer`, and requires identical final token ids. The wire carries text, so
+the ids are observed at the coordinator's detokenizer, which receives the
+verified final ids immediately before the `final` event. The clip must be mono
+16 kHz signed 16-bit PCM.
+
+```bash
+export DEVL_SMOKE_AUDIO=/path/to/clip_16k_mono_s16.wav
+
+DEVL_SMOKE_WHISPER_DIR=/path/to/whisper-tiny.en \
+  cargo test --release -p devl-server --features candle --test real_model_smoke \
+  whisper -- --ignored --nocapture
+
+DEVL_SMOKE_QWEN3_ASR_DIR=/path/to/Qwen3-ASR-1.7B \
+  cargo test --release -p devl-server --features candle --test real_model_smoke \
+  qwen3_asr -- --ignored --nocapture
+```
+
+`DEVL_SMOKE_WHISPER_TOKENIZER` overrides the Whisper tokenizer path.
+
 ## Build and Test
 
 ```bash
@@ -251,7 +411,7 @@ prepared in the fixture directory at measurement time.
 - **Implemented:** `devl-core` (`DevlBackend` trait, `DevlSession` state machine, single-pass verify/rollback/resume loop, `PriorityScheduler` with step-level cooperative preemption, and deterministic `MockBackend` test suite) and the `devl` facade crate.
 - **Implemented:** Local Whisper inference over Candle, deterministic mel extraction, per-layer KV-cache truncation, and local streaming examples.
 - **In progress (`v0.2`):** Qwen3-ASR over Candle. The windowed audio encoder, decoder, and `DevlBackend` integration with reusable audio windows and prefix KV are implemented. Exact greedy token parity with the pinned upstream checkpoint is validated locally on five clips (`f32`, CPU), see `docs/ARCHITECTURE.md` Section 6.16 for scope and limits.
-- **In progress (`v0.2`):** `devl-server`. The transport-neutral streaming contract, per-stream state machine, and the session coordinator that drives per-stream sessions through `PriorityScheduler` and WebSocket and HTTP streaming adapters over that coordinator are implemented (see `docs/SERVER_CONTRACT.md`). Pluggable per-stream VAD/endpointing hooks with a deterministic reference policy are implemented; backend selection is planned.
+- **In progress (`v0.2`):** `devl-server`. The transport-neutral streaming contract, per-stream state machine, and the session coordinator that drives per-stream sessions through `PriorityScheduler` and WebSocket and HTTP streaming adapters over that coordinator are implemented (see `docs/SERVER_CONTRACT.md`). Pluggable per-stream VAD/endpointing hooks with a deterministic reference policy are implemented. A local `devl-server` binary selects the mock, Whisper, or Qwen3-ASR backend, and CI plus opt-in real-model smoke tests exercise both transports (see Local server). Hosted deployment, TLS, and authentication are not implemented.
 
 ## Contributing
 
