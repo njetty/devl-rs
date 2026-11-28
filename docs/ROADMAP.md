@@ -39,7 +39,7 @@ Released on crates.io as [`devl-core` 0.1.0](https://crates.io/crates/devl-core/
 
 ## v0.2.0 — Qwen3-ASR Backend & Network Server
 
-Extend `devl-candle` with windowed encoder/KV reuse and introduce a network transport crate built cleanly on top of `devl-core`.
+Released on crates.io as [`devl-core` 0.2.0](https://crates.io/crates/devl-core/0.2.0), [`devl-candle` 0.2.0](https://crates.io/crates/devl-candle/0.2.0), and [`devl` 0.2.0](https://crates.io/crates/devl/0.2.0). This release adds Qwen3-ASR window and KV reuse and a local HTTP and WebSocket server. The server is distributed from the [`v0.2.0` source tag](https://github.com/njetty/devl-rs/tree/v0.2.0).
 
 ### Qwen3-ASR Backend in `devl-candle`
 
