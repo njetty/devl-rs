@@ -78,6 +78,7 @@ pub struct StreamContract {
     samples_received: u64,
     credit: u64,
     last_revision: Option<u64>,
+    auto_committed: bool,
 }
 
 fn order(msg: &str) -> StreamError {
@@ -99,6 +100,7 @@ impl StreamContract {
             samples_received: 0,
             credit: 0,
             last_revision: None,
+            auto_committed: false,
         })
     }
 
@@ -130,6 +132,22 @@ impl StreamContract {
     /// Number of audio frames accepted so far.
     pub fn frames_received(&self) -> u64 {
         self.next_seq
+    }
+
+    /// Server-initiated commit (endpointing). Moves `Streaming` to
+    /// `Committing` exactly like an accepted client `Commit` and returns
+    /// `true`. In any other phase it changes nothing and returns `false`, so a
+    /// manual commit and an automatic one cannot both succeed.
+    ///
+    /// After this, client `Audio` and `Commit` are ignored rather than errors
+    /// because they were in flight when the server committed.
+    pub fn begin_auto_commit(&mut self) -> bool {
+        if self.phase != StreamPhase::Streaming || !self.started_emitted {
+            return false;
+        }
+        self.phase = StreamPhase::Committing;
+        self.auto_committed = true;
+        true
     }
 
     fn fail(&mut self, err: StreamError) -> StreamError {
@@ -171,6 +189,10 @@ impl StreamContract {
                 Ok(Accepted::Cancel)
             }
             (_, P::CancelPending) => Ok(Accepted::Ignored),
+            (
+                ClientMessage::Audio(_) | ClientMessage::Commit { .. },
+                P::Committing | P::Finalized,
+            ) if self.auto_committed => Ok(Accepted::Ignored),
             (ClientMessage::Start { version, format }, P::AwaitingStart) => {
                 self.start(*version, *format)
             }

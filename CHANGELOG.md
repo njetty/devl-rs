@@ -7,6 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and ver
 
 ### Added
 - `devl-candle`: Qwen3-ASR causal text decoder with prefill, incremental greedy step, absolute RoPE positions, a forkable and truncatable KV cache, and selective pinned local loading of the decoder weights.
+- `devl-server`: pluggable per-stream VAD and endpointing hooks (`EndpointPolicy`, `Coordinator::with_endpointing`) that can request checkpoint drafts and end the turn, a deterministic `SilenceEndpointPolicy`, and a shared contract transition so manual and automatic commit produce exactly one final.
 
 ## [0.1.0]
 

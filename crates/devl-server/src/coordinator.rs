@@ -25,6 +25,13 @@
 //! coarser cadence bounds how much non-preemptible work a draft adds; see
 //! `docs/ARCHITECTURE.md`, Section 6.10 D6.
 //!
+//! # Endpointing
+//!
+//! [`Coordinator::with_endpointing`] installs a per-stream
+//! [`crate::endpoint::EndpointPolicy`] that can request checkpoint drafts and
+//! end the turn. Automatic and manual commit share one contract transition and
+//! one submission path. See [`crate::endpoint`].
+//!
 //! # Bounded buffering
 //!
 //! * Inbound audio waits in a per-stream pending buffer only while a worker
@@ -71,6 +78,7 @@ use devl_core::{
 };
 use thiserror::Error;
 
+use crate::endpoint::{EndpointDecision, EndpointPolicy, EndpointPolicyFactory};
 use crate::error::{ErrorCode, StreamError};
 use crate::events::EventQueue;
 use crate::limits::StreamLimits;
@@ -172,6 +180,7 @@ where
     detokenizer: Detokenizer,
     scheduler: PriorityScheduler<Arc<StreamShared<B>>>,
     registry: Mutex<Registry>,
+    endpointing: Option<EndpointPolicyFactory>,
     next_stream_id: AtomicU64,
 }
 
@@ -193,6 +202,26 @@ where
         backend: B,
         detokenizer: impl Fn(&[TokenId]) -> String + Send + Sync + 'static,
         config: CoordinatorConfig,
+    ) -> Result<Self, CoordinatorError> {
+        Self::build(backend, detokenizer, config, None)
+    }
+
+    /// Like [`Coordinator::new`], with a server-side endpointing policy per
+    /// stream. See [`crate::endpoint`] for semantics.
+    pub fn with_endpointing(
+        backend: B,
+        detokenizer: impl Fn(&[TokenId]) -> String + Send + Sync + 'static,
+        config: CoordinatorConfig,
+        endpointing: EndpointPolicyFactory,
+    ) -> Result<Self, CoordinatorError> {
+        Self::build(backend, detokenizer, config, Some(endpointing))
+    }
+
+    fn build(
+        backend: B,
+        detokenizer: impl Fn(&[TokenId]) -> String + Send + Sync + 'static,
+        config: CoordinatorConfig,
+        endpointing: Option<EndpointPolicyFactory>,
     ) -> Result<Self, CoordinatorError> {
         if config.workers == 0 {
             return Err(CoordinatorError::InvalidConfig(
@@ -227,6 +256,7 @@ where
                 streams: HashMap::new(),
                 shutting_down: false,
             }),
+            endpointing,
             next_stream_id: AtomicU64::new(1),
         });
 
@@ -273,6 +303,7 @@ where
                 next_revision: 0,
                 last_partial_samples: 0,
                 last_partial_text: None,
+                policy: shared.endpointing.as_ref().map(|f| f(id)),
             }),
             session: Mutex::new(Some(session)),
             events: EventQueue::new(),
@@ -366,6 +397,8 @@ struct StreamState {
     next_revision: u64,
     last_partial_samples: u64,
     last_partial_text: Option<String>,
+    /// Per-stream endpointing hook; `None` leaves commits to the client.
+    policy: Option<Box<dyn EndpointPolicy>>,
 }
 
 /// Lock order: `state` and `session` are never held together by the
@@ -420,7 +453,28 @@ where
                 let n = samples.len() as u64;
                 st.pending.extend_from_slice(&samples);
                 st.samples_since_draft += n;
-                if st.samples_since_draft >= self.ctx.config.draft_cadence_samples
+                let total = st.contract.samples_received();
+                let decision = match st.policy.as_mut() {
+                    None => EndpointDecision::Continue,
+                    Some(policy) => {
+                        match catch_unwind(AssertUnwindSafe(|| policy.on_audio(&samples, total))) {
+                            Ok(d) => d,
+                            Err(_) => {
+                                let e = internal("endpoint policy panicked");
+                                self.fail_locked(&mut st, e.clone());
+                                drop(st);
+                                self.release_session(false);
+                                return Err(e);
+                            }
+                        }
+                    }
+                };
+                // The contract arbitrates: an automatic end of turn commits only
+                // from `Streaming`, the same transition a client `Commit` makes.
+                if decision == EndpointDecision::EndTurn && st.contract.begin_auto_commit() {
+                    self.start_commit_locked(&mut st);
+                } else if (st.samples_since_draft >= self.ctx.config.draft_cadence_samples
+                    || decision == EndpointDecision::Checkpoint)
                     && !st.committing
                     && !st.done
                 {
@@ -430,12 +484,7 @@ where
                 drop(st);
                 self.pump(false);
             }
-            Accepted::Commit => {
-                if !st.done {
-                    st.committing = true;
-                    self.ctx.scheduler.submit_commit(self.id, Arc::clone(self));
-                }
-            }
+            Accepted::Commit => self.start_commit_locked(&mut st),
             Accepted::Cancel => {
                 self.emit_locked(&mut st, ServerEvent::Cancelled);
                 self.finish_locked(&mut st);
@@ -450,6 +499,15 @@ where
             Accepted::Ignored => {}
         }
         Ok(())
+    }
+
+    /// Submit the final. Shared by manual and automatic commit; the contract
+    /// has already made the phase transition, so this runs once per stream.
+    fn start_commit_locked(self: &Arc<Self>, st: &mut StreamState) {
+        if !st.done {
+            st.committing = true;
+            self.ctx.scheduler.submit_commit(self.id, Arc::clone(self));
+        }
     }
 
     /// Validate `event` against the contract, then queue it. A rejected event
@@ -476,6 +534,7 @@ where
 
     fn finish_locked(&self, st: &mut StreamState) {
         st.done = true;
+        st.policy = None;
         st.pending = Vec::new();
         self.closed.store(true, Ordering::Release);
     }
